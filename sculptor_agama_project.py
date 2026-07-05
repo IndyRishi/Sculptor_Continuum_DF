@@ -3230,7 +3230,17 @@ def ap25_lnlike_continuous(theta, data, K=11, nf=64):
 
 def ap25_lnprob_continuous(theta, data):
     lp = ap25_lnprior_continuous(theta)
-    return (lp + ap25_lnlike_continuous(theta, data)) if np.isfinite(lp) else -np.inf
+    if not np.isfinite(lp):
+        return -np.inf
+    return lp + ap25_lnlike_continuous(theta, data, K=data.get('_K', 11))
+
+
+def ap25_lnprob_continuous_reduced(free_theta, data):
+    """Reduced-dimension wrapper: samples only the free parameters (data['_free_idx']),
+    holding the rest fixed at data['_template']. Module-level so it pickles for the pool."""
+    th = data['_template'].copy()
+    th[data['_free_idx']] = free_theta
+    return ap25_lnprob_continuous(th, data)
 
 
 def ap25_generate_continuous_mock(n_stars=1339, seed=7, truth=CONT_TRUTH):
@@ -3288,15 +3298,16 @@ def run_continuous_smoke():
     return ll
 
 
-def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5",
-                         resume=None, nsub=None, use_mock=False,
-                         feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
+def run_continuous_chain(nwalkers=None, nsteps=2000, nproc=None, backend="cont.h5",
+                         resume=None, nsub=None, use_mock=False, fix_nuisance=False,
+                         K=11, feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
     """
-    Fit the continuous f(J,[Fe/H]) model (Phase 6) by MCMC. use_mock=True runs the
-    recovery test (known gradient kJ and slope gamma); otherwise the real Tolstoy+2023
-    data. Cluster-scale: ~K x the per-star projectedDF cost, 18 dimensions, >=38 walkers.
-    Re-run to resume from `backend`. Writes cont_chain.npy, figure_continuous_corner.png,
-    and the paper's Fig.4 (figure_ap25_fig4.png).
+    Fit the continuous f(J,[Fe/H]) model (Phase 6) by MCMC. use_mock=True runs the recovery
+    test (known gradient kJ and slope gamma); otherwise the real Tolstoy+2023 data.
+    fix_nuisance=True holds the 5 contamination parameters at their fiducial/known values
+    (18->13 sampled dims, fewer walkers -- big speed-up for the mock recovery). K sets the
+    number of (expensive) metallicity DF nodes. Re-run to resume from `backend`. Writes
+    cont_chain.npy (always the full 18-column vector), figure_continuous_corner.png, Fig.4.
     """
     import os, emcee, multiprocessing as mp
     if nproc is None:
@@ -3317,21 +3328,34 @@ def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5"
         idx = rng.choice(len(data['R']), nsub, replace=False)
         data = {k: (v[idx] if hasattr(v, '__len__') and len(v) == len(data['R']) else v) for k, v in data.items()}
         print(f"  subsampled to {len(data['R'])} stars")
+    data['_K'] = int(K)
 
-    ndim = CONT_NDIM; nw = max(nwalkers, 2 * ndim + 2)
-    init = None if resume else cont_truth_vector()             # truth-ish seed (Sculptor-like)
+    template = cont_truth_vector()                             # Sculptor-like seed / known truth
+    nuis = [CONT_PARAM_NAMES.index(p) for p in ('V_C', 'sigV_C', 'M_C', 'sigM_C', 'f_C')]
+    free_idx = np.array([i for i in range(CONT_NDIM) if not (fix_nuisance and i in nuis)])
+    ndim = len(free_idx); nw = max(2 * ndim + 2, nwalkers or 0)
+    print(f"  fitting {ndim}/{CONT_NDIM} params"
+          + (" (contamination fixed at fiducial)" if fix_nuisance else "")
+          + f", K={K} metallicity nodes, {nw} walkers")
+    if fix_nuisance:
+        data['_template'] = template.copy(); data['_free_idx'] = free_idx
+        lnprob_fn = ap25_lnprob_continuous_reduced
+    else:
+        lnprob_fn = ap25_lnprob_continuous
+
+    init = None if resume else template[free_idx]
     p0 = None
     if not resume:
-        span = (CONT_PRIOR_HI - CONT_PRIOR_LO)
+        span = (CONT_PRIOR_HI - CONT_PRIOR_LO)[free_idx]
         p0 = np.clip(init + 0.03 * span * rng.standard_normal((nw, ndim)),
-                     CONT_PRIOR_LO + 1e-6, CONT_PRIOR_HI - 1e-6)
+                     CONT_PRIOR_LO[free_idx] + 1e-6, CONT_PRIOR_HI[free_idx] - 1e-6)
     moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
     bk = emcee.backends.HDFBackend(backend) if HAS_H5PY else None
     resume_ok = bool(resume and bk is not None and os.path.exists(backend) and bk.iteration > 0)
-    print(f"  {'RESUMING' if resume_ok else 'STARTING'} {backend} | nwalkers={nw}, +{nsteps} steps, nproc={nproc}")
+    print(f"  {'RESUMING' if resume_ok else 'STARTING'} {backend} | +{nsteps} steps, nproc={nproc}")
     pool = mp.Pool(nproc) if nproc > 1 else None
     try:
-        s = emcee.EnsembleSampler(nw, ndim, ap25_lnprob_continuous, args=(data,),
+        s = emcee.EnsembleSampler(nw, ndim, lnprob_fn, args=(data,),
                                   moves=moves, pool=pool, backend=bk)
         if resume_ok:
             s.run_mcmc(None, nsteps, progress=True)
@@ -3343,13 +3367,16 @@ def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5"
         if pool is not None:
             pool.close(); pool.join()
 
-    rep = mcmc_convergence_report(s, CONT_TEX)
-    flat = s.get_chain(discard=rep['burn'], thin=rep['thin'], flat=True)
-    if len(flat) < 50:
-        flat = s.get_chain(discard=max(1, s.iteration // 3), flat=True)
+    free_tex = [CONT_TEX[i] for i in free_idx]
+    rep = mcmc_convergence_report(s, free_tex)
+    flat_free = s.get_chain(discard=rep['burn'], thin=rep['thin'], flat=True)
+    if len(flat_free) < 50:
+        flat_free = s.get_chain(discard=max(1, s.iteration // 3), flat=True)
+    flat = np.tile(template, (len(flat_free), 1))              # reconstruct full 18-col chain
+    flat[:, free_idx] = flat_free
     np.save("cont_chain.npy", flat)
     try:
-        make_corner_plot(flat, CONT_TEX, "figure_continuous_corner.png")
+        make_corner_plot(flat_free, free_tex, "figure_continuous_corner.png")
     except Exception as exc:
         print(f"  corner skipped ({exc})")
     try:                                                        # Fig.4 from the DM sub-vector
@@ -3362,7 +3389,8 @@ def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5"
     print("\n  === posterior (median +/- 68% CI) ===")
     for k, nm in enumerate(CONT_PARAM_NAMES):
         p16, p50, p84 = np.percentile(flat[:, k], [16, 50, 84])
-        print(f"    {nm:<10} = {p50:8.3f}  (+{p84 - p50:.3f} / -{p50 - p16:.3f})")
+        fx = "  [fixed]" if (fix_nuisance and k in nuis) else ""
+        print(f"    {nm:<10} = {p50:8.3f}  (+{p84 - p50:.3f} / -{p50 - p16:.3f}){fx}")
     gi = CONT_PARAM_NAMES.index('gamma'); ki = CONT_PARAM_NAMES.index('kJ')
     g16, g50, g84 = np.percentile(flat[:, gi], [16, 50, 84])
     k16, k50, k84 = np.percentile(flat[:, ki], [16, 50, 84])
@@ -3371,7 +3399,10 @@ def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5"
     print(f"  CONTINUOUS:  gamma = {g50:.2f} (+{g84 - g50:.2f} / -{g50 - g16:.2f}){tag}")
     print(f"               gradient kJ = {k50:.2f} (+{k84 - k50:.2f} / -{k50 - k16:.2f})  "
           f"({'detected' if k84 < 0 else 'consistent with 0'})")
-    print(f"               AP25 published gamma: 0.39 (+0.23 / -0.26)")
+    if use_mock:
+        print(f"               [recovery] truth gamma={CONT_TRUTH['gamma']}, kJ={CONT_TRUTH['kJ']}")
+    else:
+        print(f"               AP25 published gamma: 0.39 (+0.23 / -0.26)")
     print("  " + "-" * 58)
     return s
 
@@ -3452,8 +3483,10 @@ if __name__ == "__main__":
         _explicit_steps = any(a == "--steps" or a.startswith("--steps=") for a in sys.argv)
         if _explicit_steps and _args.steps > 50:
             _bk = _args.backend if _args.backend != "scl25.h5" else "cont.h5"
+            _nsub = _args.nsub or (400 if _args.mock else 0)     # mock -> lean subsample by default
             run_continuous_chain(nsteps=_args.steps, nproc=(_args.nproc or None),
-                                 backend=_bk, nsub=_args.nsub, use_mock=_args.mock,
+                                 backend=_bk, nsub=(_nsub or None), use_mock=_args.mock,
+                                 fix_nuisance=True, K=(9 if _args.mock else 11),
                                  resume=(False if _args.no_resume else None))
         else:
             run_continuous_smoke()

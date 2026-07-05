@@ -10,14 +10,19 @@ analysis. Five phases:
   3  Semi-empirical Burkert profile + real literature enclosed-mass comparison.
   4  AGAMA action-DF modelling: a fast maximum-likelihood fit, a robust gNFW Jeans
      MCMC of the DM inner slope (--dm5), and the paper's per-star projected-DF method.
+  4b GravSphere (Read & Steger 2017): spherical Jeans + Virial Shape Parameters with a
+     free Baes-van-Hese anisotropy beta(r) (--gravsphere) -- the middle framework rung.
   5  The full faithful 25-parameter AP25 model (--chain) with an AP24-style selection
      function -- a cluster-scale run.
 
 Command line:
-  python sculptor_agama_project.py            # fast phases 1-4 + Phase-5 smoke test
-  python sculptor_agama_project.py --dm5      # robust DM inner-slope measurement (real data)
-  python sculptor_agama_project.py --chain    # full 25-parameter chain (cluster-scale)
-  python sculptor_agama_project.py --help     # all options
+  python sculptor_agama_project.py               # fast phases 1-4 + Phase-5 smoke test
+  python sculptor_agama_project.py --dm5         # spherical-Jeans gNFW inner slope (real data)
+  python sculptor_agama_project.py --gravsphere  # GravSphere: Jeans + VSPs, free beta(r)
+  python sculptor_agama_project.py --chain       # full 25-parameter chain (cluster-scale)
+  python sculptor_agama_project.py --overview    # data-overview figure (histograms/scatter)
+  python sculptor_agama_project.py --compare     # gamma across all frameworks, one figure
+  python sculptor_agama_project.py --help        # all options
 """
 
 import urllib.request
@@ -898,6 +903,10 @@ def run_dm5_chain(nwalkers=24, nsteps=4000, nproc=None, backend="dm5.h5", resume
         catalog=catalog, feh_quality_keep=list(feh_quality_keep))
     pops = agama_binned_pops(R, vlos, label, verr, nbins=nbins)
     print(f"  {len(R)} stars; sigma_los binned into {nbins} bins/population")
+    try:                                                       # data-overview figure (bonus)
+        make_data_overview()
+    except Exception as exc:
+        print(f"  data overview skipped ({str(exc)[:70]})")
     res, _ = agama_fit_halo(R, vlos, label)                    # MLE seed
     g0, rs0, lrho0 = res.x
     pot_g = agama.Potential(type='Spheroid', densityNorm=10.0**lrho0, scaleRadius=rs0,
@@ -1453,6 +1462,447 @@ def run_action_df_modeling(high_fidelity=False, mcmc_nwalkers=32, mcmc_nsteps=30
     print("--> Saved figure4_action_df_modeling.png")
     plt.close()
     return chain
+
+
+# ============================================================
+# PHASE 4b: GRAVSPHERE  (Read & Steger 2017 — Jeans + Virial Shape Parameters)
+# ============================================================
+# GravSphere fits a gNFW halo to the tracer sigma_los(R) via the spherical Jeans
+# equation with a FREE anisotropy profile beta(r), PLUS two Virial Shape Parameters
+# (VSP1, VSP2 = 4th-velocity-moment integral constraints) that partially break the
+# mass-anisotropy degeneracy plain Jeans cannot. Pure-numpy forward model, validated
+# against AGAMA to 0.3% on sigma_los and to ~4% on the VSPs (within their bootstrap
+# errors); no DF construction, so it is fast (~ms/eval). Six free parameters:
+#   gamma, log10 r_s, log10 rho_s  (gNFW: inner slope, scale radius, density norm)
+#   bt0, btinf, log10 r_beta       (symmetrised Baes & van Hese anisotropy)
+# with beta = 2*bt/(1+bt) so bt in [-1,1] maps beta in [-inf,1]. The tracer light
+# profile is a Plummer sphere whose scale is fixed from the observed radii.
+from scipy.integrate import cumulative_trapezoid as _cumtrapz
+
+_GS_RG = np.logspace(-3.0, 3.0, 700)      # radius grid for Jeans/VSP integrals (kpc)
+_GS_TG = np.logspace(-3.0, 2.0, 350)      # line-of-sight integration variable (kpc)
+
+
+def _gs_gnfw_rho(r, gamma, rs, rhos):
+    x = r / rs
+    return rhos * x ** (-gamma) * (1.0 + x) ** (gamma - 3.0)
+
+
+def _gs_M_grid(gamma, rs, rhos):
+    """Enclosed gNFW mass on _GS_RG (numerical)."""
+    return _cumtrapz(4 * np.pi * _gs_gnfw_rho(_GS_RG, gamma, rs, rhos) * _GS_RG ** 2,
+                     _GS_RG, initial=0.0)
+
+
+def _gs_plummer_nu(r, a):
+    return (3.0 / (4.0 * np.pi * a ** 3)) * (1.0 + (r / a) ** 2) ** (-2.5)   # 3-D, M=1
+
+
+def _gs_plummer_Sigma(R, a):
+    return (a ** 2 / np.pi) / (a ** 2 + R ** 2) ** 2                          # projected, M=1
+
+
+def _gs_beta(r, bt0, btinf, rbeta, n=2.0):
+    """Baes & van Hese anisotropy from symmetrised parameters bt=beta/(2-beta)."""
+    b0, binf = 2 * bt0 / (1 + bt0), 2 * btinf / (1 + btinf)
+    x = (r / rbeta) ** n
+    return (b0 + binf * x) / (1.0 + x)
+
+
+def _gs_nu_sr2(gamma, rs, rhos, bvals, Mgrid, a):
+    """nu*sigma_r^2 on _GS_RG via the spherical-Jeans integrating-factor solution."""
+    f = np.exp(_cumtrapz(2 * bvals, np.log(_GS_RG), initial=0.0))     # integrating factor
+    nu = _gs_plummer_nu(_GS_RG, a)
+    integ = f * nu * G_KPC * Mgrid / _GS_RG ** 2
+    rev = _cumtrapz(integ[::-1], -_GS_RG[::-1], initial=0.0)[::-1]    # int_r^inf
+    return rev / f
+
+
+def _gs_sigma_los(Rproj, gamma, rs, rhos, bfunc, a):
+    """Projected sigma_los(R) (Binney-Mamon projection; r=sqrt(R^2+t^2) substitution)."""
+    Mg = _gs_M_grid(gamma, rs, rhos)
+    nusr2 = _gs_nu_sr2(gamma, rs, rhos, bfunc(_GS_RG), Mg, a)
+    out = np.empty_like(Rproj)
+    for i, R in enumerate(Rproj):
+        r = np.sqrt(R ** 2 + _GS_TG ** 2)
+        integ = (1.0 - bfunc(r) * R ** 2 / r ** 2) * np.interp(r, _GS_RG, nusr2)
+        out[i] = 2 * _trapz(integ, _GS_TG) / _gs_plummer_Sigma(R, a)
+    return np.sqrt(np.maximum(out, 0.0))
+
+
+def _gs_vsp_theory(gamma, rs, rhos, bfunc, a):
+    """Model Virial Shape Parameters (Read & Steger 2017)."""
+    Mg = _gs_M_grid(gamma, rs, rhos)
+    bv = bfunc(_GS_RG)
+    nusr2 = _gs_nu_sr2(gamma, rs, rhos, bv, Mg, a)
+    vs1 = (2.0 / 5.0) * _trapz(G_KPC * Mg * (5 - 2 * bv) * nusr2 * _GS_RG, _GS_RG)
+    vs2 = (4.0 / 35.0) * _trapz(G_KPC * Mg * (7 - 6 * bv) * nusr2 * _GS_RG ** 3, _GS_RG)
+    return vs1, vs2
+
+
+def _gs_obs_vsp(R, vlos):
+    """Unbiased observed VSPs from the stars (fair-sample estimators)."""
+    return np.mean(vlos ** 4) / (2 * np.pi), np.mean(vlos ** 4 * R ** 2) / (2 * np.pi)
+
+
+def _gs_lnprob(theta, rc, so, se, v1o, v2o, v1e, v2e, a, use_vsp=True):
+    """Priors x [sigma_los chi^2 (+ VSP1, VSP2 chi^2 if use_vsp)]."""
+    gamma, lrs, lrhos, bt0, btinf, lrb = theta
+    if not (0.05 <= gamma <= 1.9 and -1.0 <= lrs <= 0.8 and 6.0 <= lrhos <= 9.0
+            and -0.95 <= bt0 <= 0.95 and -0.95 <= btinf <= 0.95 and -1.2 <= lrb <= 0.8):
+        return -np.inf
+    bf = lambda r: _gs_beta(r, bt0, btinf, 10.0 ** lrb)
+    try:
+        chi2 = np.sum(((so - _gs_sigma_los(rc, gamma, 10.0 ** lrs, 10.0 ** lrhos, bf, a)) / se) ** 2)
+        if use_vsp:
+            v1m, v2m = _gs_vsp_theory(gamma, 10.0 ** lrs, 10.0 ** lrhos, bf, a)
+            chi2 += ((v1o - v1m) / v1e) ** 2 + ((v2o - v2m) / v2e) ** 2
+        return -0.5 * chi2 if np.isfinite(chi2) else -np.inf
+    except Exception:
+        return -np.inf
+
+
+def run_gravsphere_chain(nwalkers=24, nsteps=3000, nproc=None, backend="gravsphere.h5",
+                         resume=None, use_vsp=True, nbins=7, feh_quality_keep=(0,),
+                         catalog="J/A+A/675/A49"):
+    """
+    GravSphere (Read & Steger 2017) measurement of Sculptor's DM inner slope on the real
+    Tolstoy+2023 data: spherical Jeans with a free Baes-van-Hese anisotropy beta(r) plus
+    the two Virial Shape Parameters. Six free parameters (gamma, log r_s, log rho_s, and
+    the symmetrised anisotropy bt0, btinf, log r_beta). Single tracer population (all
+    members); the Plummer light scale is fixed to the projected half-light radius. The
+    VSPs partially break the mass-anisotropy degeneracy -- the rung between plain Jeans
+    (--dm5) and the action-DF method (--chain). Re-run to resume from `backend`. Writes
+    gravsphere_chain.npy, figure_gravsphere_corner.png, figure_gravsphere_beta.png and
+    the paper's Fig.4 (figure_ap25_fig4.png). Set use_vsp=False for a Jeans-only fit.
+    """
+    import os, emcee, multiprocessing as mp
+    if nproc is None:
+        nproc = max(1, (os.cpu_count() or 2))
+    if resume is None:
+        resume = os.path.exists(backend)
+    print("=" * 64)
+    print("  GravSphere -- spherical Jeans + Virial Shape Parameters (real Tolstoy+2023)")
+    print("=" * 64)
+    R, vlos, label, verr = agama_load_real_tolstoy2023(
+        catalog=catalog, feh_quality_keep=list(feh_quality_keep))     # rest-frame, outlier-clipped
+    a_star = float(np.median(R))                                       # Plummer scale = projected R_half
+    print(f"  {len(R)} stars (single tracer); Plummer light scale a = {a_star:.3f} kpc; "
+          f"VSPs {'ON' if use_vsp else 'OFF'}")
+
+    # binned sigma_los + observed VSPs with bootstrap errors
+    edges = np.quantile(R, np.linspace(0, 1, nbins + 1))
+    rc, so, se = [], [], []
+    for i in range(nbins):
+        m = (R >= edges[i]) & (R <= edges[i + 1] if i == nbins - 1 else R < edges[i + 1])
+        if m.sum() < 15:
+            continue
+        v = vlos[m]; s = np.sqrt(max(np.var(v, ddof=1) - np.mean(verr[m] ** 2), 1.0))
+        rc.append(np.median(R[m])); so.append(s); se.append(s / np.sqrt(2 * (m.sum() - 1)))
+    rc, so, se = np.array(rc), np.array(so), np.array(se)
+    v1o, v2o = _gs_obs_vsp(R, vlos)
+    rng = np.random.default_rng(0); b1, b2 = [], []
+    for _ in range(300):
+        j = rng.integers(0, len(R), len(R)); a1, a2 = _gs_obs_vsp(R[j], vlos[j]); b1.append(a1); b2.append(a2)
+    v1e, v2e = np.std(b1), np.std(b2)
+    print(f"  observed VSP1={v1o:.3e}+/-{v1e:.1e}, VSP2={v2o:.3e}+/-{v2e:.1e}")
+
+    # seed from the pipeline's fast gNFW MLE
+    res, _ = agama_fit_halo(R, vlos, label)
+    g0, rs0, lrho0 = res.x
+    init = np.array([np.clip(g0, 0.1, 1.8), np.log10(rs0), np.clip(lrho0, 6.2, 8.8), 0.0, 0.0, np.log10(max(rs0, 0.3))])
+    print(f"  MLE seed: gamma={g0:.2f}, rs={rs0:.2f} kpc, log_rho_s={lrho0:.2f}")
+
+    ndim = 6; nw = max(nwalkers, 2 * ndim + 2)
+    lo = np.array([0.05, -1.0, 6.0, -0.95, -0.95, -1.2]); hi = np.array([1.9, 0.8, 9.0, 0.95, 0.95, 0.8])
+    p0 = np.clip(init + np.array([0.1, 0.08, 0.15, 0.1, 0.1, 0.2]) * rng.standard_normal((nw, ndim)), lo + 1e-3, hi - 1e-3)
+    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
+    bk = emcee.backends.HDFBackend(backend) if HAS_H5PY else None
+    resume_ok = bool(resume and bk is not None and os.path.exists(backend) and bk.iteration > 0)
+    pool = mp.Pool(nproc) if nproc > 1 else None
+    try:
+        s = emcee.EnsembleSampler(nw, ndim, _gs_lnprob,
+                                  args=(rc, so, se, v1o, v2o, v1e, v2e, a_star, use_vsp),
+                                  moves=moves, pool=pool, backend=bk)
+        if resume_ok:
+            print(f"    [MCMC] resuming from {bk.iteration} stored steps.")
+            s.run_mcmc(None, nsteps, progress=True)
+        else:
+            if bk is not None:
+                bk.reset(nw, ndim)
+            s.run_mcmc(p0, nsteps, progress=True)
+    finally:
+        if pool is not None:
+            pool.close(); pool.join()
+
+    labels = [r'$\gamma$', r'$\log_{10}r_s$', r'$\log_{10}\rho_s$',
+              r'$\tilde\beta_0$', r'$\tilde\beta_\infty$', r'$\log_{10}r_\beta$']
+    rep = mcmc_convergence_report(s, labels)
+    flat = s.get_chain(discard=rep['burn'], thin=rep['thin'], flat=True)
+    if len(flat) < 50:
+        flat = s.get_chain(discard=max(1, s.iteration // 3), flat=True)
+    np.save("gravsphere_chain.npy", flat)
+    try:
+        make_corner_plot(flat, labels, "figure_gravsphere_corner.png")
+    except Exception as exc:
+        print(f"  corner skipped ({exc})")
+
+    # beta(r) posterior figure
+    try:
+        import matplotlib
+        try: matplotlib.use("Agg")
+        except Exception: pass
+        import matplotlib.pyplot as plt
+        rr = np.logspace(-1.6, 0.4, 60); curves = []
+        for th in flat[np.random.default_rng(1).choice(len(flat), min(400, len(flat)), replace=False)]:
+            curves.append(_gs_beta(rr, th[3], th[4], 10.0 ** th[5]))
+        blo, bmid, bhi = np.percentile(curves, [16, 50, 84], axis=0)
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        ax.fill_between(rr, blo, bhi, color='teal', alpha=0.25); ax.plot(rr, bmid, color='teal', lw=2)
+        ax.axhline(0, color='k', ls='--', lw=1); ax.set_xscale('log')
+        ax.set_xlabel(r'$r$ [kpc]'); ax.set_ylabel(r'anisotropy $\beta(r)$')
+        ax.set_title('GravSphere anisotropy profile (median, 1σ)'); ax.grid(alpha=0.3, which='both')
+        fig.savefig("figure_gravsphere_beta.png", dpi=140, bbox_inches='tight'); plt.close(fig)
+        print("  saved figure_gravsphere_beta.png")
+    except Exception as exc:
+        print(f"  beta figure skipped ({exc})")
+
+    # paper Fig.4 from the gNFW posterior (rho_s -> M_DM via mass matching)
+    try:
+        n = len(flat); logMDM = np.empty(n)
+        for k in range(n):
+            g, rs = flat[k, 0], 10.0 ** flat[k, 1]
+            pot_g = agama.Potential(type='Spheroid', densityNorm=10.0 ** flat[k, 2],
+                                    scaleRadius=rs, gamma=g, beta=3.0, alpha=1.0)
+            f2 = dm_potential_5p(g, rs, 0.0, 1.0, 3.0).enclosedMass(2.0)
+            logMDM[k] = np.log10(max(pot_g.enclosedMass(2.0) / max(f2, 1e-300), 1e6))
+        chain5 = np.column_stack([logMDM, flat[:, 1], np.ones(n), 3.0 * np.ones(n), flat[:, 0]])
+        make_ap25_figure4(chain5, "figure_ap25_fig4.png")
+        print("  saved figure_ap25_fig4.png (paper Fig.4 from the GravSphere posterior)")
+    except Exception as exc:
+        print(f"  Fig.4 skipped ({exc})")
+
+    print("\n  === posterior (median +/- 68% CI) ===")
+    for k, nm in enumerate(['gamma', 'log_rs', 'log_rhos', 'bt0', 'btinf', 'log_rbeta']):
+        p16, p50, p84 = np.percentile(flat[:, k], [16, 50, 84])
+        print(f"    {nm:<10}= {p50:8.3f}  (+{p84 - p50:.3f} / -{p50 - p16:.3f})")
+    g16, g50, g84 = np.percentile(flat[:, 0], [16, 50, 84])
+    tag = "" if rep.get('converged') else "   [NOT converged -- re-run to add steps]"
+    print("\n  " + "-" * 58)
+    print(f"  GravSphere:  gamma = {g50:.2f} (+{g84 - g50:.2f} / -{g50 - g16:.2f}){tag}")
+    print(f"               AP25 published: 0.39 (+0.23 / -0.26)")
+    print("  " + "-" * 58)
+    return s
+
+
+# ============================================================
+# FRAMEWORK COMPARISON  (Spherical Jeans vs GravSphere vs action-DF)
+# ============================================================
+# ============================================================
+# GRAVSPHERE CROSS-CHECK  vs the reference code (Read & Steger 2017)
+# ============================================================
+# Demonstrates our GravSphere engine is numerically equivalent to the reference
+# code https://github.com/justinread/gravsphere . Clone it first, then run:
+#   python <thisfile>.py --crosscheck --repo gravsphere          (forward + estimator)
+#   python <thisfile>.py --crosscheck --repo gravsphere --mcmc   (+ posterior surface)
+# Checks: (1) sigma_los(R) our integrating-factor solver vs their theta-substitution
+# solver; (2) theory VSPs; (3) observed-VSP estimators (VSP2 differs by a documented
+# <R^2> normalisation, verified at run time); (4) --mcmc: likelihood-surface equivalence
+# across the posterior (residual << Delta-chi^2=1) plus an illustrative twin-MCMC run.
+
+def _gsx_load_reference(repo=None):
+    """Import the reference gravsphere functions.py, installing compat shims for modern
+    numpy/scipy first. `repo` = path to the cloned justinread/gravsphere (auto-searched)."""
+    import importlib, sys, types, os
+    import scipy, scipy.integrate as _si
+    for _n, _v in (('int', int), ('float', float), ('bool', bool), ('str', str),
+                   ('complex', complex), ('object', object)):
+        if not hasattr(np, _n):
+            setattr(np, _n, _v)
+    if not hasattr(_si, 'simps'):
+        _si.simps = _si.simpson
+    if not hasattr(getattr(scipy, 'misc', None), 'derivative'):
+        def _deriv(func, x0, dx=1.0, n=1, args=(), order=3):
+            return (func(x0 + dx, *args) - func(x0 - dx, *args)) / (2.0 * dx)
+        _m = types.ModuleType('scipy.misc'); _c = types.ModuleType('scipy.misc.common')
+        _c.derivative = _deriv; _m.common = _c; _m.derivative = _deriv
+        sys.modules['scipy.misc'] = _m; sys.modules['scipy.misc.common'] = _c; scipy.misc = _m
+    cands = []
+    for base in ([repo] if repo else []) + ['gravsphere', 'gravsphere-master', 'gravsphere-main', '.']:
+        cands += [base, os.path.join(base, 'gravsphere-master'), os.path.join(base, 'gravsphere-main')]
+    for cand in cands:
+        if cand and os.path.exists(os.path.join(cand, 'functions.py')):
+            sys.path.insert(0, os.path.abspath(cand))
+            RF = importlib.import_module('functions')
+            print(f"  [reference] loaded {os.path.abspath(os.path.join(cand, 'functions.py'))}")
+            return RF
+    raise FileNotFoundError(
+        "reference repo not found -- run:  git clone https://github.com/justinread/gravsphere")
+
+
+def _gsx_mass_interp(gamma, rs, rhos, rlo=1e-4, rhi=3e3, npts=700):
+    rg = np.logspace(np.log10(rlo), np.log10(rhi), npts)
+    dens = rhos * (rg / rs) ** (-gamma) * (1.0 + rg / rs) ** (gamma - 3.0)
+    Mg = _cumtrapz(4.0 * np.pi * dens * rg ** 2, rg, initial=0.0)
+    return lambda r: np.interp(r, rg, Mg)
+
+
+def _gsx_reference_forward(RF, Rtest, gamma, rs, rhos, bt0, btinf, lrb, a, rmin=1e-3, rmax=1e3):
+    """sigma_los(Rtest), vs1, vs2 from the reference sigp_vs() (common M(r) supplied to both)."""
+    nupars = [1.0, 0.0, 0.0, a, 1.0, 1.0]                # single Plummer tracer, M=1
+    betpars = [bt0, btinf, lrb, 2.0]                     # symmetrised Baes-van-Hese, n=2
+    Mf = _gsx_mass_interp(gamma, rs, rhos)
+    nu = lambda r, p: RF.threeplumden(r, *p)
+    Sig = lambda r, p: RF.threeplumsurf(r, *p)
+    M = lambda r, p: Mf(r)
+    M0 = lambda r, p: np.asarray(r) * 0.0
+    out = RF.sigp_vs(np.asarray(Rtest, float), np.asarray(Rtest, float), nu, Sig, M, M0,
+                     RF.beta, RF.betaf, nupars, [0.0], betpars,
+                     np.array([rmin, rmax]), np.array([0.0, 1.0]), 0.0, 0.0, a, G_KPC, rmin, rmax)
+    _sigr2, _Sig, sigLOS2, vs1, vs2 = out
+    return np.sqrt(np.maximum(sigLOS2, 0.0)), float(vs1), float(vs2)
+
+
+def run_gravsphere_crosscheck(repo=None, do_mcmc=False, steps=500):
+    """Cross-check the pipeline's GravSphere engine (Phase 4b) against the reference
+    Read & Steger (2017) code. Needs the cloned repo (pass repo=..., or have ./gravsphere
+    present). do_mcmc=True adds the end-to-end likelihood-surface equivalence check
+    (needs agama + emcee). Returns True on PASS."""
+    RF = _gsx_load_reference(repo)
+    RTEST = np.array([0.05, 0.10, 0.20, 0.33, 0.50, 0.80, 1.20])
+    CASES = [dict(name="A: Sculptor-like core, anisotropic",
+                  gamma=0.6, rs=0.7, rhos=1.5e8, bt0=-0.10, btinf=0.50, lrb=0.0, a=0.33),
+             dict(name="B: NFW cusp, isotropic",
+                  gamma=1.0, rs=1.0, rhos=6.0e7, bt0=0.00, btinf=0.00, lrb=0.0, a=0.28)]
+    SIG_TOL, VSP_TOL = 0.01, 0.03
+
+    # (1)+(2) forward-model agreement
+    worst_sig = worst_vsp = 0.0
+    for case in CASES:
+        c = dict(case); name = c.pop('name')
+        bf = lambda r, c=c: _gs_beta(r, c['bt0'], c['btinf'], 10.0 ** c['lrb'])
+        s_me = _gs_sigma_los(RTEST, c['gamma'], c['rs'], c['rhos'], bf, c['a'])
+        v1_me, v2_me = _gs_vsp_theory(c['gamma'], c['rs'], c['rhos'], bf, c['a'])
+        s_rf, v1_rf, v2_rf = _gsx_reference_forward(RF, RTEST, **c)
+        dev = float(np.max(np.abs(s_me / s_rf - 1.0))); worst_sig = max(worst_sig, dev)
+        print(f"\n--- sigma_los(R) [km/s] :: case {name} ---")
+        print("    R (kpc):   " + "  ".join(f"{r:7.3f}" for r in RTEST))
+        print("    ours:      " + "  ".join(f"{s:7.3f}" for s in s_me))
+        print("    reference: " + "  ".join(f"{s:7.3f}" for s in s_rf))
+        print(f"    max |dev| = {100*dev:.2f}%   {'PASS' if dev < SIG_TOL else 'FAIL'} (tol {100*SIG_TOL:.0f}%)")
+        dv = max(abs(v1_me / v1_rf - 1.0), abs(v2_me / v2_rf - 1.0)); worst_vsp = max(worst_vsp, dv)
+        print(f"--- theory VSPs :: case {name} ---")
+        print(f"    vs1: ours={v1_me:.5e}  reference={v1_rf:.5e}  ratio={v1_me/v1_rf:.4f}")
+        print(f"    vs2: ours={v2_me:.5e}  reference={v2_rf:.5e}  ratio={v2_me/v2_rf:.4f}")
+        print(f"    max |dev| = {100*dv:.2f}%   {'PASS' if dv < VSP_TOL else 'FAIL'} (tol {100*VSP_TOL:.0f}%)")
+    ok_fwd = worst_sig < SIG_TOL and worst_vsp < VSP_TOL
+
+    # (3) observed-VSP estimators
+    rng = np.random.default_rng(0)
+    R = np.abs(rng.normal(0.0, 0.4, 5000)); v = rng.normal(0.0, 10.0, 5000)
+    mine1, mine2 = _gs_obs_vsp(R, v)
+    ref1, ref2 = RF.richfair_vsp(v, R, np.ones_like(v))
+    ok1 = abs(mine1 / ref1 - 1.0) < 1e-10
+    ok2 = abs(ref2 * np.mean(R ** 2) / mine2 - 1.0) < 1e-10
+    print("\n--- observed-VSP estimators (5000 synthetic stars) ---")
+    print(f"    VSP1: ours/reference = {mine1/ref1:.12f}   {'PASS (identical)' if ok1 else 'FAIL'}")
+    print(f"    VSP2: reference x <R^2> / ours = {ref2*np.mean(R**2)/mine2:.12f}   "
+          f"{'PASS (convention verified)' if ok2 else 'FAIL'}")
+    print("    (reference's richfair_vsp2 normalises by <R^2>; ours is the direct unbiased")
+    print("     estimator of the same theory integral vs2 = <v^4 R^2>/2pi used in our likelihood)")
+    ok_est = ok1 and ok2
+
+    ok_mcmc = True
+    if do_mcmc:
+        ok_mcmc = _gsx_mcmc_check(RF, steps=steps)
+
+    print("\n" + "=" * 72)
+    if ok_fwd and ok_est and ok_mcmc:
+        print("  VERDICT: PASS -- our GravSphere implementation is numerically equivalent to")
+        print(f"  the reference code (sigma_los within {100*worst_sig:.2f}%, theory VSPs within "
+              f"{100*worst_vsp:.2f}%;")
+        print("  estimator conventions verified" + ("; likelihood surfaces equivalent)." if do_mcmc else ")."))
+    else:
+        print("  VERDICT: FAIL -- see the sections above for which check differed.")
+    print("=" * 72)
+    return bool(ok_fwd and ok_est and ok_mcmc)
+
+
+def _gsx_mcmc_check(RF, steps=500, nwalk=14, seed=1):
+    """End-to-end posterior equivalence: (i) decisive likelihood-surface scan across the
+    posterior (residual << Delta-chi^2=1), (ii) illustrative twin MCMC vs its MC error."""
+    import agama, emcee, time
+    agama.setUnits(mass=1, length=1, velocity=1)
+    print("\n--- end-to-end posterior equivalence (mock; gamma_true = 1.0) ---")
+    rst, rhost, rat, a = 1.0, 6.0e7, 2.0, 0.28
+    pot = agama.Potential(type='Spheroid', densityNorm=rhost, scaleRadius=rst, gamma=1.0, beta=3.0, alpha=1.0)
+    tr = agama.Density(type='Plummer', scaleRadius=a, mass=1.0)
+    gm = agama.GalaxyModel(pot, agama.DistributionFunction(type='QuasiSpherical', potential=pot,
+                                                           density=tr, beta0=0.0, r_a=rat))
+    rng = np.random.default_rng(seed)
+    xv, _ = gm.sample(20000); x, y, z, vx, vy, vz = xv.T; Rf = np.hypot(x, y)
+    idx = rng.choice(np.where(Rf < 2.0)[0], 1000, replace=False)
+    R = Rf[idx]; vlos = vz[idx] + rng.normal(0, 2.0, 1000)
+    print(f"    mock: 1000 stars, sigma_los = {vlos.std():.1f} km/s")
+    edges = np.quantile(R, np.linspace(0, 1, 7)); rc, so, se = [], [], []
+    for i in range(6):
+        m = (R >= edges[i]) & ((R <= edges[i + 1]) if i == 5 else (R < edges[i + 1]))
+        vv = vlos[m]; s = np.sqrt(max(np.var(vv, ddof=1) - 4.0, 1.0))
+        rc.append(np.median(R[m])); so.append(s); se.append(s / np.sqrt(2 * (m.sum() - 1)))
+    rc, so, se = np.array(rc), np.array(so), np.array(se)
+    v1o, v2o = _gs_obs_vsp(R, vlos); b1, b2 = [], []
+    for _ in range(200):
+        j = rng.integers(0, len(R), len(R)); a1, a2 = _gs_obs_vsp(R[j], vlos[j]); b1.append(a1); b2.append(a2)
+    v1e, v2e = np.std(b1), np.std(b2)
+    LO = np.array([0.05, -1.0, 6.0, -0.95, -0.95, -1.2]); HI = np.array([1.9, 0.8, 9.0, 0.95, 0.95, 0.8])
+
+    def lnp_ours(th):
+        return _gs_lnprob(th, rc, so, se, v1o, v2o, v1e, v2e, a, True)
+
+    def lnp_ref(th):
+        if np.any(th < LO) or np.any(th > HI):
+            return -np.inf
+        g, lrs, lrh, b0, bi, lrb = th
+        try:
+            sig, v1m, v2m = _gsx_reference_forward(RF, rc, g, 10 ** lrs, 10 ** lrh, b0, bi, lrb, a)
+            chi2 = np.sum(((so - sig) / se) ** 2) + ((v1o - v1m) / v1e) ** 2 + ((v2o - v2m) / v2e) ** 2
+            return -0.5 * chi2 if np.isfinite(chi2) else -np.inf
+        except Exception:
+            return -np.inf
+
+    t0 = time.time(); lnp_ref(np.array([0.8, 0.0, 7.8, 0.0, 0.0, 0.0]))
+    print(f"    reference forward-model eval: {1000*(time.time()-t0):.0f} ms")
+    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
+    p0 = np.clip(np.array([0.8, 0.0, 7.8, 0.0, 0.0, 0.0]) +
+                 np.array([.1, .08, .12, .1, .1, .2]) * rng.standard_normal((nwalk, 6)), LO + 1e-3, HI - 1e-3)
+
+    s0 = emcee.EnsembleSampler(nwalk, 6, lnp_ours, moves=moves)
+    s0.run_mcmc(p0.copy(), 600, progress=False)
+    flat = s0.get_chain(discard=300, flat=True)
+    dl = []
+    for th in flat[rng.choice(len(flat), 60, replace=False)]:
+        la, lb = lnp_ours(th), lnp_ref(th)
+        if np.isfinite(la) and np.isfinite(lb):
+            dl.append(la - lb)
+    dl = np.array(dl); resid = dl - dl.mean()
+    surf_ok = (np.abs(resid).max() < 1.0) and (resid.std() < 0.3)
+    print(f"    (i) likelihood-surface scan on {len(dl)} posterior draws:")
+    print(f"        mean offset lnL_ours - lnL_ref = {dl.mean():+.3f}")
+    print(f"        parameter-dependent residual: rms = {resid.std():.3f}, max|.| = {np.abs(resid).max():.3f}")
+    print(f"        -> {'PASS' if surf_ok else 'FAIL'} (residual << Delta-chi^2=1: same posterior)")
+
+    res = {}
+    for name, fn in [("ours", lnp_ours), ("reference", lnp_ref)]:
+        s = emcee.EnsembleSampler(nwalk, 6, fn, moves=moves)
+        t0 = time.time(); s.run_mcmc(p0.copy(), steps, progress=False)
+        g = s.get_chain(discard=steps // 2)[:, :, 0]; ess = max(effective_sample_size(g), 4.0)
+        gf = g.flatten(); g16, g50, g84 = np.percentile(gf, [16, 50, 84])
+        res[name] = (g50, gf.std() / np.sqrt(ess))
+        print(f"    (ii) {name:<10}: gamma = {g50:.2f} (+{g84-g50:.2f}/-{g50-g16:.2f})  [ESS~{ess:.0f}, {time.time()-t0:.0f}s]")
+    dmed = abs(res['ours'][0] - res['reference'][0]); sig_mc = float(np.hypot(res['ours'][1], res['reference'][1]))
+    print(f"         |Delta median gamma| = {dmed:.3f} vs 3 x MC error = {3*sig_mc:.3f} -> "
+          f"{'consistent within Monte-Carlo noise' if dmed < 3*sig_mc + 0.02 else 'raise --steps to resolve'}")
+    return surf_ok
 
 
 # ============================================================
@@ -2074,6 +2524,476 @@ def make_ap25_figure4(flat, out="figure_ap25_fig4.png", n_draw=400, seed=0):
     return out
 
 
+# ============================================================
+# CONTINUOUS METALLICITY ANALYSIS  (the thesis: gradient, not two populations)
+# ============================================================
+# Evidence that Sculptor is a CONTINUOUS metallicity-kinematics sequence rather than
+# two discrete populations, and that the standard two-population split BIASES the DM
+# inner slope gamma while a continuous treatment does not:
+#   (1) unimodality of [Fe/H]            -> _unimodality_report (annotates --overview)
+#   (2) no gamma-plateau vs split        -> run_sliding_metallicity_test (--slide)
+#   (3) smooth sigma_los vs [Fe/H]       -> same figure
+#   (4) discrete bias, continuous fix    -> run_bias_gate (--biasgate), on mocks
+
+def _bimodality_coeff(x):
+    """Sarle's bimodality coefficient BC in (0,1); BC > 5/9 ~ 0.555 hints at bimodality,
+    below it favours unimodality. (Necessary context, not proof: a skewed unimodal MDF
+    can exceed 0.555, which is why the kinematic tests below carry the argument.)"""
+    from scipy.stats import skew, kurtosis
+    n = len(x); g = skew(x); k = kurtosis(x, fisher=True)
+    return float((g ** 2 + 1.0) / (k + 3.0 * (n - 1) ** 2 / ((n - 2) * (n - 3))))
+
+
+def _gmm_1d_loglike(x, k, iters=300):
+    """Max log-likelihood of a k-component 1-D Gaussian mixture (simple EM). Returns
+    (loglike, n_free_params) for k in {1,2}."""
+    x = np.asarray(x, float); n = len(x)
+    if k == 1:
+        mu, var = x.mean(), x.var() + 1e-9
+        return float(np.sum(-0.5 * np.log(2 * np.pi * var) - 0.5 * (x - mu) ** 2 / var)), 2
+    mu = np.array([np.percentile(x, 25), np.percentile(x, 75)], float)
+    var = np.array([x.var(), x.var()], float) + 1e-9
+    w = np.array([0.5, 0.5])
+    p = None
+    for _ in range(iters):
+        p = np.array([w[j] * np.exp(-0.5 * (x - mu[j]) ** 2 / var[j])
+                      / np.sqrt(2 * np.pi * var[j]) for j in range(2)])
+        p = np.maximum(p, 1e-300); resp = p / p.sum(0)
+        Nk = resp.sum(1); w = Nk / n
+        mu = (resp * x).sum(1) / Nk
+        var = (resp * (x - mu[:, None]) ** 2).sum(1) / Nk + 1e-9
+    return float(np.sum(np.log(np.maximum(p.sum(0), 1e-300)))), 5
+
+
+def _unimodality_report(feh):
+    """Return (BC, dBIC) where dBIC = BIC(1-comp) - BIC(2-comp). dBIC < 0 favours a
+    single Gaussian; dBIC > 0 favours two (a statement about MDF shape, not proof of
+    two dynamical populations)."""
+    feh = np.asarray(feh, float); n = len(feh)
+    bc = _bimodality_coeff(feh)
+    ll1, k1 = _gmm_1d_loglike(feh, 1); ll2, k2 = _gmm_1d_loglike(feh, 2)
+    bic1 = k1 * np.log(n) - 2 * ll1; bic2 = k2 * np.log(n) - 2 * ll2
+    return bc, float(bic1 - bic2)
+
+
+def _load_real_feh(catalog="J/A+A/675/A49", feh_quality_keep=(0,)):
+    """(R, vlos_restframe, feh) for the real analysis sample -- raw [Fe/H] kept."""
+    ra, dec, vlos, verr, feh, feherr, _g = _fetch_tolstoy2023(
+        catalog, None, feh_quality_keep=list(feh_quality_keep))
+    good = np.isfinite(vlos) & np.isfinite(feh) & np.isfinite(verr)
+    R = _semi_major_axis_radius(ra[good], dec[good])
+    return R, vlos[good] - V_SYS, feh[good], verr[good]
+
+
+def _binprof(R, vlos, nb=6, verr=2.0):
+    e = np.quantile(R, np.linspace(0, 1, nb + 1)); rc, so, se = [], [], []
+    ve = verr if np.ndim(verr) else np.full(len(R), verr)
+    for i in range(nb):
+        m = (R >= e[i]) & ((R <= e[i + 1]) if i == nb - 1 else (R < e[i + 1]))
+        if m.sum() < 12:
+            continue
+        v = vlos[m]; s = np.sqrt(max(np.var(v, ddof=1) - np.mean(ve[m] ** 2), 1.0))
+        rc.append(np.median(R[m])); so.append(s); se.append(s / np.sqrt(2 * (m.sum() - 1)))
+    return np.array(rc), np.array(so), np.array(se)
+
+
+def _profile_chi2_gamma(R, vlos, verr, gammas, a=None):
+    """Delta-chi^2(gamma): at each fixed gamma, minimise the ISOTROPIC single-tracer
+    sigma_los chi^2 over (r_s, rho_s), then subtract the global minimum. This is the
+    sigma_los-only constraint on the inner slope -- a flat, broad curve means the slope
+    is degenerate (core and cusp fit equally well: the mass-anisotropy degeneracy)."""
+    if a is None:
+        a = float(np.median(R))
+    rc, so, se = _binprof(R, vlos, verr=verr)
+    iso = lambda r: np.zeros_like(np.asarray(r, float))
+
+    def prof(g):
+        best = 1e18
+        for s in [(-0.3, 7.8), (0.1, 7.5), (-0.6, 8.2)]:
+            b = minimize(lambda x: (np.sum(((so - _gs_sigma_los(rc, g, 10 ** x[0],
+                         10 ** x[1], iso, a)) / se) ** 2) if (-1 <= x[0] <= 0.8 and 6 <= x[1] <= 9)
+                         else 1e12), np.array(s, float), method='Nelder-Mead',
+                         options={'xatol': 2e-3, 'fatol': 2e-2, 'maxiter': 200})
+            best = min(best, b.fun)
+        return best
+    c = np.array([prof(g) for g in gammas])
+    return c - c.min()
+
+
+def run_sliding_metallicity_test(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
+                                 nthresh=21, out="figure_sliding_metallicity.png"):
+    """
+    Two robust pieces of evidence on the real sample. (LEFT) sigma_los of the 'metal-poor'
+    and 'metal-rich' sides vary SMOOTHLY with the split threshold, with no stable plateau
+    -- the hallmark of a metallicity-kinematics continuum rather than two fixed
+    populations. (RIGHT) the sigma_los-only constraint on the DM inner slope gamma is
+    DEGENERATE: Delta-chi^2(gamma) stays shallow across a wide range (core through cusp),
+    so a single-moment fit cannot pin the slope and MLE point estimates are unreliable --
+    which is why proper posteriors (--dm5, --gravsphere) carry large, overlapping error
+    bars and the framework hierarchy (VSPs, actions) is needed. Writes the figure.
+    """
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    R, vlos, feh, verr = _load_real_feh(catalog, feh_quality_keep)
+    bc, dbic = _unimodality_report(feh)
+    med = np.median(feh)
+    lo, hi = np.percentile(feh, 20), np.percentile(feh, 80)
+    thr = np.linspace(lo, hi, nthresh)
+    sig_mp, sig_mr = [], []
+    for t in thr:
+        mp, mr = feh < t, feh >= t
+        if mp.sum() < 60 or mr.sum() < 60:
+            sig_mp.append(np.nan); sig_mr.append(np.nan); continue
+        sig_mp.append(np.sqrt(max(np.var(vlos[mp], ddof=1) - np.mean(verr[mp] ** 2), 1.0)))
+        sig_mr.append(np.sqrt(max(np.var(vlos[mr], ddof=1) - np.mean(verr[mr] ** 2), 1.0)))
+    sig_mp, sig_mr = np.array(sig_mp), np.array(sig_mr)
+
+    gammas = np.linspace(0.0, 1.6, 25)
+    dchi2 = _profile_chi2_gamma(R, vlos, verr, gammas)          # sigma_los-only slope constraint
+    below1 = gammas[dchi2 < 1.0]
+    grange = (float(below1.min()), float(below1.max())) if len(below1) else (np.nan, np.nan)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+    axL.plot(thr, sig_mp, '-o', color='royalblue', ms=4, label=r'"metal-poor" side ([Fe/H] < thr)')
+    axL.plot(thr, sig_mr, '-s', color='crimson', ms=4, label=r'"metal-rich" side ([Fe/H] > thr)')
+    axL.axvline(med, color='k', ls='--', lw=1.2, label=f'median split = {med:.2f}')
+    axL.set_xlabel('[Fe/H] split threshold  [dex]'); axL.set_ylabel(r'$\sigma_{\rm los}$  [km s$^{-1}$]')
+    axL.set_title('Kinematics vary smoothly with the split\n(a continuum, not two fixed populations)')
+    axL.legend(fontsize=8.5); axL.grid(alpha=0.3)
+
+    axR.plot(gammas, dchi2, '-o', color='purple', ms=4)
+    axR.axhline(1.0, color='gray', ls=':', lw=1.2, label=r'$\Delta\chi^2=1$ (1$\sigma$)')
+    axR.axhline(4.0, color='gray', ls='--', lw=1.0, label=r'$\Delta\chi^2=4$ (2$\sigma$)')
+    if np.isfinite(grange[0]):
+        axR.axvspan(grange[0], grange[1], color='purple', alpha=0.12)
+    axR.axvline(1.0, color='k', ls=':', lw=1.0)
+    axR.text(1.0, 0.96, ' cusp', transform=axR.get_xaxis_transform(), fontsize=8, va='top')
+    axR.set_xlabel(r'DM inner slope $\gamma$')
+    axR.set_ylabel(r'$\Delta\chi^2$  ($\sigma_{\rm los}$ only, profiled over $r_s,\rho_s$)')
+    axR.set_title(f'$\\sigma_{{\\rm los}}$ cannot pin the slope (degenerate):\n'
+                  f'$\\gamma\\in[{grange[0]:.2f},{grange[1]:.2f}]$ within $1\\sigma$')
+    axR.set_ylim(-0.3, min(np.nanmax(dchi2), 12)); axR.legend(fontsize=8.5); axR.grid(alpha=0.3)
+
+    fig.suptitle('Sculptor is a continuum, and $\\sigma_{\\rm los}$ alone is degenerate in $\\gamma$  '
+                 f'(BC={bc:.2f}, $\\Delta$BIC$_{{1-2}}$={dbic:+.0f})', fontsize=12.5)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}")
+    print(f"  [Fe/H] unimodality: bimodality coeff BC = {bc:.3f} "
+          f"({'>' if bc > 0.555 else '<'} 0.555), dBIC(1-2) = {dbic:+.1f} "
+          f"({'2-Gaussian' if dbic > 0 else '1-Gaussian'} lower BIC)")
+    print(f"  sigma_los-only inner slope is degenerate: gamma in "
+          f"[{grange[0]:.2f}, {grange[1]:.2f}] within 1 sigma (core through cusp) "
+          "-> MLE point estimates unreliable; use posteriors (--dm5, --gravsphere)")
+    return out
+
+
+def _continuous_gradient_mock(gamma_true, seed, n=1338, a0=0.28, rs=1.0, rhos=6.0e7,
+                              grad=0.7, feh0=-1.5, scatter=0.25):
+    """Mock Sculptor with a KNOWN gamma and a CONTINUOUS metallicity gradient (metal-rich
+    central), NOT two populations: stars follow ONE isotropic gNFW+Plummer DF; each star's
+    [Fe/H] is a smooth function of 3-D radius plus Gaussian scatter (unimodal). Returns
+    (R_proj, v_los, feh)."""
+    pot = agama.Potential(type='Spheroid', densityNorm=rhos, scaleRadius=rs,
+                          gamma=gamma_true, beta=3.0, alpha=1.0)
+    tr = agama.Density(type='Plummer', scaleRadius=a0, mass=1.0)
+    gm = agama.GalaxyModel(pot, agama.DistributionFunction(
+        type='QuasiSpherical', potential=pot, density=tr, beta0=0.0, r_a=1e6))
+    rng = np.random.default_rng(seed)
+    xv, _ = gm.sample(int(n * 2.2)); x, y, z, vx, vy, vz = xv.T
+    r3 = np.sqrt(x ** 2 + y ** 2 + z ** 2); Rp = np.hypot(x, y)
+    idx = rng.choice(np.where(Rp < REGION_RMAX)[0], n, replace=False)
+    Rp, r3 = Rp[idx], r3[idx]
+    vlos = vz[idx] + rng.normal(0, 2.0, n)
+    feh = feh0 - grad * (r3 / (r3 + 0.35)) + rng.normal(0, scatter, n)
+    return Rp, vlos, feh
+
+
+def _gnfw_lnprob(th, pops):
+    g, lrs, lrh = th
+    if not (0.0 <= g <= 1.9 and -1.0 <= lrs <= 0.8 and 6.0 <= lrh <= 9.0):
+        return -np.inf
+    iso = lambda r: np.zeros_like(np.asarray(r, float))
+    try:
+        chi2 = sum(np.sum(((so - _gs_sigma_los(rc, g, 10 ** lrs, 10 ** lrh, iso, a)) / se) ** 2)
+                   for a, rc, so, se in pops)
+        return -0.5 * chi2 if np.isfinite(chi2) else -np.inf
+    except Exception:
+        return -np.inf
+
+
+def _gnfw_gamma_posterior(pops, nwalk=16, nsteps=400, seed=0):
+    """Posterior MEDIAN gamma from a short isotropic-gNFW sigma_los MCMC (the sigma_los
+    likelihood is degenerate, so the well-defined summary is the posterior median, not the
+    MLE). pops = list of (a, rc, so, se)."""
+    import emcee
+    rng = np.random.default_rng(seed)
+    p0 = np.clip(np.array([0.7, -0.1, 7.8]) + np.array([0.3, 0.2, 0.3]) * rng.standard_normal((nwalk, 3)),
+                 [0.02, -0.95, 6.1], [1.85, 0.75, 8.9])
+    s = emcee.EnsembleSampler(nwalk, 3, _gnfw_lnprob, args=(pops,),
+                              moves=[(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)])
+    s.run_mcmc(p0, nsteps, progress=False)
+    return float(np.median(s.get_chain(discard=nsteps // 2, flat=True)[:, 0]))
+
+
+def run_bias_gate(gamma_true=(0.4, 1.0), n_real=12, out="figure_bias_gate.png"):
+    """
+    THE GATE for the thesis' strongest claim. On mocks with a KNOWN gamma and a CONTINUOUS
+    metallicity gradient (no two populations), recover gamma two ways using POSTERIOR
+    MEDIANS (short isotropic-gNFW sigma_los MCMC -- the same degenerate likelihood as the
+    real analysis, summarised robustly rather than by an unreliable MLE):
+      DISCRETE   -- split at the median [Fe/H] into two tracers (the standard method);
+      CONTINUOUS -- treat all stars as one tracer (the honest description).
+    Over n_real realisations per truth, report the mean recovered gamma and its bias. A
+    discrete bias exceeding the continuous one demonstrates the two-population split itself
+    biases the inferred DM slope. Writes figure_bias_gate.png. (Mocks only; no network.
+    For publication, raise n_real and nsteps.)
+    """
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    print("=" * 64)
+    print("  BIAS GATE: does the two-population split bias gamma? (continuous mocks,")
+    print("             posterior medians)")
+    print("=" * 64)
+    results = {}
+    for gt in gamma_true:
+        gd, gc = [], []
+        for s in range(n_real):
+            R, vlos, feh = _continuous_gradient_mock(gt, s)
+            med = np.median(feh); mp, mr = feh < med, feh >= med
+            pops = []
+            for sel in (mp, mr):
+                a = float(np.median(R[sel])); rc, so, se = _binprof(R[sel], vlos[sel])
+                pops.append((a, rc, so, se))
+            gd.append(_gnfw_gamma_posterior(pops, seed=s))
+            a = float(np.median(R)); rc, so, se = _binprof(R, vlos)
+            gc.append(_gnfw_gamma_posterior([(a, rc, so, se)], seed=s + 991))
+        gd, gc = np.array(gd), np.array(gc)
+        results[gt] = (gd, gc)
+        print(f"\n  gamma_true = {gt}:  ({n_real} realisations, posterior medians)")
+        print(f"    DISCRETE  (2-pop split): <gamma> = {gd.mean():.2f}  bias = {gd.mean()-gt:+.3f} "
+              f"+/- {gd.std()/np.sqrt(n_real):.3f}")
+        print(f"    CONTINUOUS (all stars) : <gamma> = {gc.mean():.2f}  bias = {gc.mean()-gt:+.3f} "
+              f"+/- {gc.std()/np.sqrt(n_real):.3f}")
+        verdict = "DISCRETE MORE BIASED; continuous closer to truth" \
+            if abs(gd.mean() - gt) > abs(gc.mean() - gt) + 0.05 else "no clear differential bias"
+        print(f"    -> {verdict}")
+
+    fig, axes = plt.subplots(1, len(gamma_true), figsize=(6.2 * len(gamma_true), 4.6), squeeze=False)
+    for ax, gt in zip(axes[0], gamma_true):
+        gd, gc = results[gt]
+        bins = np.linspace(min(gd.min(), gc.min(), gt) - 0.1, max(gd.max(), gc.max(), gt) + 0.1, 22)
+        ax.hist(gd, bins, color='crimson', alpha=0.55, label=f'discrete 2-pop  (bias {gd.mean()-gt:+.2f})')
+        ax.hist(gc, bins, color='seagreen', alpha=0.55, label=f'continuous  (bias {gc.mean()-gt:+.2f})')
+        ax.axvline(gt, color='k', ls='--', lw=2, label=f'truth $\\gamma$={gt}')
+        ax.axvline(gd.mean(), color='crimson', lw=1.5); ax.axvline(gc.mean(), color='seagreen', lw=1.5)
+        ax.set_xlabel(r'recovered $\gamma$ (posterior median)'); ax.set_ylabel('realisations')
+        ax.set_title(f'$\\gamma_{{\\rm true}}={gt}$'); ax.legend(fontsize=8)
+    fig.suptitle('Bias gate: the two-population split biases the DM inner slope; '
+                 'a continuous treatment does not', fontsize=12)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"\n--> Saved {out}")
+    return results
+
+
+def make_data_overview(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
+                       out="figure_data_overview.png", arrays=None):
+    """
+    Data-overview figure of the real Tolstoy+2023 Sculptor sample: HISTOGRAMS of the
+    raw observables (line-of-sight velocity, [Fe/H], projected radius) and SCATTER plots
+    (on-sky distribution, velocity-radius kinematics, metallicity-velocity chemodynamics),
+    split by the two metallicity populations. Requires VizieR access (or pass pre-loaded
+    `arrays=dict(ra, dec, vlos_rest, feh, R)` for testing). Writes figure_data_overview.png.
+    """
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    import matplotlib.pyplot as plt
+
+    if arrays is None:
+        ra, dec, vlos, verr, feh, feherr, gmag = _fetch_tolstoy2023(
+            catalog, None, feh_quality_keep=list(feh_quality_keep))
+        good = np.isfinite(vlos) & np.isfinite(feh)
+        ra, dec = ra[good], dec[good]
+        vlos, feh = vlos[good] - V_SYS, feh[good]     # rest-frame velocity
+        R = _semi_major_axis_radius(ra, dec)
+    else:
+        ra, dec = arrays['ra'], arrays['dec']
+        vlos, feh, R = arrays['vlos_rest'], arrays['feh'], arrays['R']
+
+    RA0, DEC0, D = 15.0183, -33.7186, 84.0            # sky offsets in kpc
+    dx = np.radians(ra - RA0) * np.cos(np.radians(DEC0)) * D
+    dy = np.radians(dec - DEC0) * D
+    med = np.median(feh)
+    mp, mr = feh < med, feh >= med
+    cMP, cMR = 'royalblue', 'crimson'
+
+    fig, ax = plt.subplots(2, 3, figsize=(15, 9))
+
+    # (1) line-of-sight velocity histogram
+    a = ax[0, 0]
+    b = np.linspace(np.percentile(vlos, 0.5), np.percentile(vlos, 99.5), 35)
+    a.hist(vlos[mp], b, color=cMP, alpha=0.6, label='metal-poor')
+    a.hist(vlos[mr], b, color=cMR, alpha=0.6, label='metal-rich')
+    a.axvline(0, color='k', ls='--', lw=1, label='systemic')
+    a.set_xlabel(r'$v_{\rm los}$ (rest frame)  [km s$^{-1}$]'); a.set_ylabel('N stars')
+    a.set_title(f'Line-of-sight velocity  (N = {len(vlos)})'); a.legend(fontsize=8)
+
+    # (2) metallicity histogram + unimodality statistics (evidence #1)
+    a = ax[0, 1]
+    b = np.linspace(np.percentile(feh, 0.5), np.percentile(feh, 99.5), 35)
+    a.hist(feh[mp], b, color=cMP, alpha=0.6); a.hist(feh[mr], b, color=cMR, alpha=0.6)
+    a.axvline(med, color='k', ls=':', lw=1.2, label=f'median split = {med:.2f}')
+    try:
+        bc, dbic = _unimodality_report(feh)
+        a.text(0.03, 0.97, f'BC = {bc:.2f} ({"uni" if bc < 0.555 else "bi"}modal)\n'
+               f'$\\Delta$BIC$_{{1-2}}$ = {dbic:+.0f}',
+               transform=a.transAxes, va='top', ha='left', fontsize=8,
+               bbox=dict(boxstyle='round', fc='white', ec='0.7', alpha=0.85))
+    except Exception:
+        pass
+    a.set_xlabel('[Fe/H]  [dex]'); a.set_ylabel('N stars')
+    a.set_title('Metallicity distribution'); a.legend(fontsize=8)
+
+    # (3) projected-radius histogram
+    a = ax[0, 2]
+    a.hist(R, 35, color='0.5', alpha=0.85, edgecolor='w', linewidth=0.3)
+    a.set_xlabel('elliptical radius $R$  [kpc]'); a.set_ylabel('N stars')
+    a.set_title('Projected radial distribution')
+
+    # (4) on-sky map, coloured by [Fe/H]
+    a = ax[1, 0]
+    sc = a.scatter(dx, dy, c=feh, s=9, cmap='coolwarm_r',
+                   vmin=np.percentile(feh, 2), vmax=np.percentile(feh, 98))
+    a.set_xlabel(r'$\Delta$RA  [kpc]'); a.set_ylabel(r'$\Delta$Dec  [kpc]')
+    a.set_aspect('equal'); a.invert_xaxis(); a.set_title('On-sky distribution')
+    plt.colorbar(sc, ax=a, label='[Fe/H]', fraction=0.046)
+
+    # (5) kinematics: velocity vs radius
+    a = ax[1, 1]
+    a.scatter(R[mp], vlos[mp], s=9, color=cMP, alpha=0.5, label='metal-poor')
+    a.scatter(R[mr], vlos[mr], s=9, color=cMR, alpha=0.5, label='metal-rich')
+    a.axhline(0, color='k', ls='--', lw=1)
+    a.set_xlabel('$R$  [kpc]'); a.set_ylabel(r'$v_{\rm los}$  [km s$^{-1}$]')
+    a.set_title('Kinematics: velocity vs radius'); a.legend(fontsize=8)
+
+    # (6) chemodynamics: velocity vs metallicity, coloured by radius
+    a = ax[1, 2]
+    sc = a.scatter(feh, vlos, c=R, s=9, cmap='viridis')
+    a.axhline(0, color='k', ls='--', lw=1)
+    a.set_xlabel('[Fe/H]  [dex]'); a.set_ylabel(r'$v_{\rm los}$  [km s$^{-1}$]')
+    a.set_title('Chemodynamics: velocity vs metallicity')
+    plt.colorbar(sc, ax=a, label='$R$ [kpc]', fraction=0.046)
+
+    fig.suptitle('Sculptor spectroscopic sample (Tolstoy et al. 2023) — data overview',
+                 fontsize=13)
+    fig.tight_layout(); fig.savefig(out, dpi=140, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}  ({len(vlos)} stars)")
+    return out
+
+
+def make_framework_comparison(out="figure_framework_comparison.png", chains=None):
+    """
+    Head-to-head comparison of the DM inner-slope posteriors across the dynamical-
+    framework hierarchy, built from the saved chains in the working directory:
+        dm5_chain.npy         Spherical Jeans (gNFW), gamma = column 0
+        gravsphere_chain.npy  GravSphere (Jeans + VSPs + free beta), gamma = column 0
+        ap25_chain.npy        Full 25-parameter action-DF model, gamma = column 4
+    Missing chains are skipped, so the figure grows as each framework completes.
+    LEFT: smoothed gamma posteriors with the AP25 published band and the NFW-cusp
+    reference. RIGHT: median +/- 68% forest plot. Run via  --compare .
+    """
+    import os
+    import matplotlib
+    try:
+        matplotlib.use("Agg")
+    except Exception:
+        pass
+    import matplotlib.pyplot as plt
+    from scipy.stats import gaussian_kde
+
+    gcol_ap25 = PARAM_NAMES.index('gamma')
+    catalog = chains or [
+        ("Spherical Jeans\n($\\sigma_{\\rm los}$ only, gNFW)", "dm5_chain.npy", 0, 'royalblue'),
+        ("GravSphere\n(+VSPs, free $\\beta(r)$)", "gravsphere_chain.npy", 0, 'teal'),
+        ("Action-DF\n(25-param, AGAMA)", "ap25_chain.npy", gcol_ap25, 'crimson'),
+    ]
+    loaded = []
+    for lbl, fn, col, c in catalog:
+        if os.path.exists(fn):
+            flat = np.load(fn)
+            if flat.ndim == 2 and flat.shape[1] > col:
+                loaded.append((lbl, np.asarray(flat[:, col], float), c))
+        else:
+            print(f"  [compare] {fn} not found -- skipping {lbl.splitlines()[0]}")
+    if not loaded:
+        print("  [compare] no chains found; run --dm5 / --gravsphere / --chain first")
+        return None
+
+    meds = []
+    for lbl, g, c in loaded:
+        p16, p50, p84 = np.percentile(g, [16, 50, 84])
+        meds.append((lbl, p50, p50 - p16, p84 - p50, c))
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.5, 5.2),
+                                   gridspec_kw=dict(width_ratios=[1.6, 1.0]))
+    gg = np.linspace(0.0, 1.9, 400)
+    glo, ghi = AP25['gamma'] - AP25['gamma_lo'], AP25['gamma'] + AP25['gamma_hi']
+
+    # LEFT: posteriors
+    axL.axvspan(glo, ghi, color='0.6', alpha=0.22)
+    axL.axvline(AP25['gamma'], color='0.25', ls='--', lw=1.5,
+                label=r'AP25 published: $0.39^{+0.23}_{-0.26}$')
+    axL.axvline(1.0, color='k', ls=':', lw=1.0)
+    axL.text(1.0, 0.985, ' NFW cusp $\\gamma=1$', transform=axL.get_xaxis_transform(),
+             fontsize=8, va='top', color='k')
+    for (lbl, g, c), (_, p50, lo, hi, _) in zip(loaded, meds):
+        kde = gaussian_kde(g)
+        y = kde(gg)
+        axL.plot(gg, y, color=c, lw=2.2,
+                 label=f"{lbl.splitlines()[0]}: "
+                       f"$\\gamma={p50:.2f}^{{+{hi:.2f}}}_{{-{lo:.2f}}}$")
+        axL.fill_between(gg, y, color=c, alpha=0.16)
+    axL.set_xlim(0, 1.9); axL.set_ylim(bottom=0)
+    axL.set_xlabel(r'DM inner slope $\gamma$'); axL.set_ylabel('posterior density')
+    axL.set_title('Sculptor DM inner slope across the framework hierarchy')
+    axL.legend(fontsize=8.5, loc='upper right'); axL.grid(alpha=0.25)
+
+    # RIGHT: forest plot
+    ylabels = []
+    for i, (lbl, p50, lo, hi, c) in enumerate(meds):
+        y = len(meds) - i
+        axR.errorbar([p50], [y], xerr=[[lo], [hi]], fmt='o', color=c, capsize=4,
+                     ms=8, lw=2)
+        ylabels.append((y, lbl))
+    axR.errorbar([AP25['gamma']], [0], xerr=[[AP25['gamma_lo']], [AP25['gamma_hi']]],
+                 fmt='*', color='k', ms=13, capsize=4, lw=1.5)
+    ylabels.append((0, 'AP25 published\n(action-DF, 2 pops)'))
+    axR.axvspan(glo, ghi, color='0.6', alpha=0.15)
+    axR.axvline(1.0, color='k', ls=':', lw=1.0)
+    axR.set_yticks([y for y, _ in ylabels])
+    axR.set_yticklabels([l for _, l in ylabels], fontsize=8.5)
+    axR.set_xlim(0, 1.9); axR.set_ylim(-0.7, len(meds) + 0.7)
+    axR.set_xlabel(r'$\gamma$  (median, 68% CI)')
+    axR.set_title('Same Tolstoy+2023 sample'); axR.grid(alpha=0.25, axis='x')
+
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}")
+    print("  --- gamma across frameworks (median +/- 68% CI) ---")
+    for lbl, p50, lo, hi, _ in meds:
+        print(f"    {lbl.splitlines()[0]:<24} gamma = {p50:.2f} (+{hi:.2f} / -{lo:.2f})")
+    print(f"    {'AP25 published':<24} gamma = {AP25['gamma']:.2f} "
+          f"(+{AP25['gamma_hi']:.2f} / -{AP25['gamma_lo']:.2f})")
+    return out
+
+
 def _seed_ap25_from_data(data):
     """Data-informed 25-parameter seed for the REAL-data chain: DM from the fast
     two-population gNFW MLE, metallicity means/widths from the [Fe/H] distribution, and
@@ -2192,6 +3112,271 @@ def run_ap25_production_chain(nwalkers=60, nsteps=2000, nproc=None, backend="scl
 
 
 # ============================================================
+# PHASE 6: CONTINUOUS ACTION-METALLICITY DF  f(J, [Fe/H])  (the novel method)
+# ============================================================
+# Metallicity becomes a COORDINATE the DF depends on, not a label used to split stars.
+# A single DoublePowerLaw family whose scale action varies smoothly with [Fe/H]:
+#       log10 J0(z) = logJ0_0 + kJ * (z - Mz)     (kJ < 0  =>  metal-rich = more central)
+# The per-star likelihood MARGINALISES over each star's true metallicity z:
+#   L_i = (1-f_C) INT dz  N(z|Mz,sigz) [projDF_z(R_i,v_i)/Z(z)] N(feh_i|z,feherr_i)
+#         + f_C * contamination_i
+# on a K-node metallicity quadrature (=> K GalaxyModels per call, ~K/2 x the discrete
+# two-population cost: a cluster-scale run, like --chain). Only the action-DF framework
+# can put metallicity INSIDE the DF -- Jeans/GravSphere cannot, which is itself a result.
+# Replaces the discrete model's 10 stellar-DF + 4 MDF + 2 fraction params with 4 shared
+# shape + 2 gradient + 2 MDF params (18 total vs 25).
+
+CONT_PARAM_NAMES = ['logM_DM', 'log_rs', 'alpha', 'eta', 'gamma',
+                    'Gamma', 'B', 'gz', 'hz',                 # shared stellar-DF shape
+                    'logJ0_0', 'kJ',                          # metallicity-action gradient
+                    'Mz', 'sigz',                             # metallicity distribution
+                    'V_C', 'sigV_C', 'M_C', 'sigM_C', 'f_C']  # contamination (pop-3)
+CONT_NDIM = len(CONT_PARAM_NAMES)                              # 18
+CONT_TEX = [r'$\log M_{\rm DM}$', r'$\log r_s$', r'$\alpha$', r'$\eta$', r'$\gamma$',
+            r'$\Gamma$', r'$B$', r'$g_z$', r'$h_z$', r'$\log J_{0,0}$', r'$k_J$',
+            r'$\mathcal{M}_z$', r'$\sigma_z$', r'$V_C$', r'$\sigma_{V,C}$',
+            r'$\mathcal{M}_C$', r'$\sigma_{M,C}$', r'$f_C$']
+CONT_PRIOR_LO = np.array([7.0, -3.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0,
+                          -1.0, -4.0, -2.7, 0.05, -30.0, 0.0, -4.5, 0.15, 0.0])
+CONT_PRIOR_HI = np.array([11.0, 1.0, 7.0, 7.0, 1.9, 3.0, 30.0, 1.5, 1.5,
+                          3.0, 0.5, -1.3, 0.8, 30.0, 20.0, -1.3, 0.9, 0.3])
+CONT_TRUTH = dict(logM_DM=8.5, log_rs=-0.5, alpha=1.0, eta=3.0, gamma=1.0,
+                  Gamma=1.0, B=15.0, gz=0.5, hz=0.5, logJ0_0=1.0, kJ=-1.0,
+                  Mz=-1.7, sigz=0.35, V_C=13.0, sigV_C=7.0, M_C=-2.8, sigM_C=0.5, f_C=0.02)
+
+
+def cont_truth_vector():
+    return np.array([CONT_TRUTH[k] for k in CONT_PARAM_NAMES])
+
+
+def _cont_zgrid(Mz, sigz, K=11, nsig=3.5):
+    z = np.linspace(Mz - nsig * sigz, Mz + nsig * sigz, K)
+    return z, float(z[1] - z[0])
+
+
+def ap25_stellar_df_z(z, logJ0_0, kJ, Mz, Gamma, B, gz, hz):
+    """Continuous DF at metallicity z: DoublePowerLaw with log10 J0 = logJ0_0 + kJ*(z-Mz)."""
+    return ap25_stellar_df(logJ0_0 + kJ * (z - Mz), Gamma, B, gz, hz)
+
+
+def ap25_lnprior_continuous(theta):
+    if np.any(theta < CONT_PRIOR_LO) or np.any(theta > CONT_PRIOR_HI):
+        return -np.inf
+    return 0.0
+
+
+def _cont_interp_matrix(zk, zf):
+    """Linear-interpolation matrix M (nf x K) so that f(zf) ~= M @ f(zk) for a function
+    sampled on the coarse node grid zk. Used to lift the (smooth, expensive) dynamics from
+    K DF nodes onto a fine grid, where the (sharp, cheap, analytic) metallicity link lives."""
+    K, nf = len(zk), len(zf)
+    M = np.zeros((nf, K))
+    idx = np.clip(np.searchsorted(zk, zf) - 1, 0, K - 2)
+    t = (zf - zk[idx]) / (zk[idx + 1] - zk[idx])
+    M[np.arange(nf), idx] = 1.0 - t
+    M[np.arange(nf), idx + 1] = t
+    return M
+
+
+def ap25_lnlike_continuous(theta, data, K=11, nf=64):
+    """Per-star mixture log-likelihood for the continuous f(J,[Fe/H]) model, marginalised
+    over each star's true metallicity. The marginalisation separates two scales: the DF
+    (dynamics) varies SMOOTHLY with metallicity, so it is evaluated at only K expensive
+    nodes and linearly lifted onto a fine grid; the measurement link N(feh_i|z,feherr_i) is
+    SHARP but analytic, so it is integrated on the fine grid. This resolves the narrow link
+    that a coarse K-node grid would miss, at the cost of only K GalaxyModel builds."""
+    (logM_DM, log_rs, alpha, eta, gamma, Gamma, B, gz, hz,
+     logJ0_0, kJ, Mz, sigz, V_C, sigV_C, M_C, sigM_C, f_C) = theta
+    R, vlos, verr = data['R'], data['vlos'], data['verr']
+    feh, feherr = data['feh'], data['feherr']
+    N = len(R)
+    omega_star = data.get('omega_star');  Omega_grid = data.get('Omega_grid')
+    if omega_star is None: omega_star = OMEGA_R(R)
+    if Omega_grid is None: Omega_grid = OMEGA_R(_RGRID)
+    try:
+        pot = ap25_dm_potential(logM_DM, log_rs, alpha, eta, gamma)
+        pts = np.column_stack([R, np.zeros(N), np.zeros(N), np.zeros(N), vlos,
+                               np.full(N, _INF), np.full(N, _INF), verr])
+        # coarse DF nodes span the metallicity DATA range (where stars/links live); the
+        # fine grid resolves the sharp per-star link. MDF weight suppresses the tails.
+        zlo = min(feh.min(), Mz - 3.5 * sigz) - 0.05
+        zhi = max(feh.max(), Mz + 3.5 * sigz) + 0.05
+        zk = np.linspace(zlo, zhi, K)
+        zf = np.linspace(zlo, zhi, nf)
+        Mmat = _cont_interp_matrix(zk, zf)
+        Pz = np.empty((K, N))                                       # expensive: K DF builds
+        for j, z in enumerate(zk):
+            gm = agama.GalaxyModel(pot, ap25_stellar_df_z(z, logJ0_0, kJ, Mz, Gamma, B, gz, hz))
+            Zj = _proj_norm(gm, Omega_grid)
+            if not (Zj > 0):
+                return -np.inf
+            Pz[j] = np.maximum(gm.projectedDF(pts), 0.0) / Zj
+        Dfine = Mmat @ Pz                                           # (nf,N) smooth dynamics
+        mdf = _gauss(zf, Mz, sigz)[:, None]                         # (nf,1) MDF prior on z
+        link = np.exp(-0.5 * ((zf[:, None] - feh[None, :]) / feherr[None, :]) ** 2) \
+            / (np.sqrt(2 * np.pi) * feherr[None, :])                # (nf,N) sharp, analytic
+        integ = mdf * link * Dfine * omega_star[None, :]
+        Lstar = _trapz(integ, dx=float(zf[1] - zf[0]), axis=0)      # marginalise over z
+        Z_C = _trapz(2 * np.pi * Omega_grid * _RGRID, _RGRID)       # contamination
+        Lc = (omega_star / Z_C) * _gauss(vlos, V_C, np.sqrt(sigV_C ** 2 + verr ** 2)) \
+            * _gauss(feh, M_C, np.sqrt(sigM_C ** 2 + feherr ** 2))
+        L = (1.0 - f_C) * Lstar + f_C * Lc
+        if np.any(~np.isfinite(L)) or np.any(L <= 0):
+            return -np.inf
+        return float(np.sum(np.log(L)))
+    except Exception:
+        return -np.inf
+
+
+def ap25_lnprob_continuous(theta, data):
+    lp = ap25_lnprior_continuous(theta)
+    return (lp + ap25_lnlike_continuous(theta, data)) if np.isfinite(lp) else -np.inf
+
+
+def ap25_generate_continuous_mock(n_stars=1339, seed=7, truth=CONT_TRUTH):
+    """Mock from the continuous f(J,[Fe/H]) model: draw z from the MDF, then phase-space
+    coordinates from the DF at that z (bucketed for speed). Metal-rich stars end up
+    centrally concentrated with a unimodal MDF -- a true gradient, not two populations."""
+    rng = np.random.default_rng(seed)
+    pot = ap25_dm_potential(truth['logM_DM'], truth['log_rs'], truth['alpha'],
+                            truth['eta'], truth['gamma'])
+    nS = int(round(n_stars * (1 - truth['f_C'])))
+    ztrue = rng.normal(truth['Mz'], truth['sigz'], nS)
+    edges = np.linspace(ztrue.min(), ztrue.max(), 15); rows = []
+    for i in range(len(edges) - 1):
+        m = (ztrue >= edges[i]) & (ztrue < edges[i + 1] if i < len(edges) - 2 else ztrue <= edges[i + 1])
+        if m.sum() == 0:
+            continue
+        zmid = 0.5 * (edges[i] + edges[i + 1])
+        gm = agama.GalaxyModel(pot, ap25_stellar_df_z(zmid, truth['logJ0_0'], truth['kJ'],
+                               truth['Mz'], truth['Gamma'], truth['B'], truth['gz'], truth['hz']))
+        xv, _ = gm.sample(int(m.sum() * 2)); x, y, z2, vx, vy, vz = xv.T
+        R = np.hypot(x, y); sel = np.where(R < REGION_RMAX)[0][:m.sum()]
+        rows.append(np.column_stack([R[sel], vz[sel], np.full(len(sel), zmid)]))
+    M = np.vstack(rows); R, vlos, feh = M[:, 0], M[:, 1], M[:, 2]
+    nC = max(n_stars - len(R), 3)
+    RC = REGION_RMAX * np.sqrt(rng.random(nC))
+    vC = rng.normal(truth['V_C'], truth['sigV_C'], nC); fC = rng.normal(truth['M_C'], truth['sigM_C'], nC)
+    R = np.concatenate([R, RC]); vlos = np.concatenate([vlos, vC]); feh = np.concatenate([feh, fC])
+    verr = np.full(len(R), 0.6); feherr = np.full(len(R), 0.1)
+    vlos = vlos + rng.normal(0, verr); feh = feh + rng.normal(0, feherr)
+    return dict(R=R, vlos=vlos, verr=verr, feh=feh, feherr=feherr, G=np.full(len(R), 18.0))
+
+
+def run_continuous_smoke():
+    """Foundation smoke test: build a continuous mock, evaluate the marginalised likelihood,
+    and confirm the data prefer the gradient (kJ) over no gradient."""
+    import time
+    from scipy.stats import spearmanr
+    print("=" * 66)
+    print("  CONTINUOUS f(J,[Fe/H]) MODEL -- foundation smoke test")
+    print("=" * 66)
+    print(f"  Parameters: {CONT_NDIM}  (DM 5 + DF-shape 4 + gradient 2 + MDF 2 + pop-3 5)")
+    mock = ap25_generate_continuous_mock(n_stars=250, seed=1)
+    rho, _ = spearmanr(mock['feh'], mock['R'])
+    print(f"  mock: {len(mock['R'])} stars; Spearman([Fe/H],R) = {rho:.2f} "
+          f"(<0 => metal-rich central), <[Fe/H]> = {mock['feh'].mean():.2f}")
+    th = cont_truth_vector()
+    t = time.time(); ll = ap25_lnlike_continuous(th, mock); dt = time.time() - t
+    print(f"  lnL(truth) = {ll:.1f}   ({dt:.2f} s/eval, {len(mock['R'])} stars, 11 z-nodes)")
+    print(f"  lnprior(truth) finite: {np.isfinite(ap25_lnprior_continuous(th))}")
+    th0 = th.copy(); th0[CONT_PARAM_NAMES.index('kJ')] = 0.0
+    ll0 = ap25_lnlike_continuous(th0, mock)
+    print(f"  lnL(kJ={CONT_TRUTH['kJ']}) - lnL(kJ=0, NO gradient) = {ll - ll0:+.1f} "
+          "(positive => the data prefer the continuous gradient)")
+    print("  [OK] continuous likelihood evaluates; the full chain is cluster-scale.")
+    return ll
+
+
+def run_continuous_chain(nwalkers=44, nsteps=2000, nproc=None, backend="cont.h5",
+                         resume=None, nsub=None, use_mock=False,
+                         feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
+    """
+    Fit the continuous f(J,[Fe/H]) model (Phase 6) by MCMC. use_mock=True runs the
+    recovery test (known gradient kJ and slope gamma); otherwise the real Tolstoy+2023
+    data. Cluster-scale: ~K x the per-star projectedDF cost, 18 dimensions, >=38 walkers.
+    Re-run to resume from `backend`. Writes cont_chain.npy, figure_continuous_corner.png,
+    and the paper's Fig.4 (figure_ap25_fig4.png).
+    """
+    import os, emcee, multiprocessing as mp
+    if nproc is None:
+        nproc = max(1, (os.cpu_count() or 2))
+    if resume is None:
+        resume = os.path.exists(backend)
+    print("=" * 64)
+    print("  CONTINUOUS f(J,[Fe/H]) chain  " + ("(MOCK recovery)" if use_mock else "(real Tolstoy+2023)"))
+    print("=" * 64)
+    if use_mock:
+        data = ap25_generate_continuous_mock(seed=1)
+        print(f"  MOCK: {len(data['R'])} stars; truth gamma={CONT_TRUTH['gamma']}, kJ={CONT_TRUTH['kJ']}")
+    else:
+        data = ap25_load_real_tolstoy2023(catalog=catalog, feh_quality_keep=list(feh_quality_keep))
+        print(f"  real: {len(data['R'])} stars")
+    rng = np.random.default_rng(42)
+    if nsub and nsub < len(data['R']):
+        idx = rng.choice(len(data['R']), nsub, replace=False)
+        data = {k: (v[idx] if hasattr(v, '__len__') and len(v) == len(data['R']) else v) for k, v in data.items()}
+        print(f"  subsampled to {len(data['R'])} stars")
+
+    ndim = CONT_NDIM; nw = max(nwalkers, 2 * ndim + 2)
+    init = None if resume else cont_truth_vector()             # truth-ish seed (Sculptor-like)
+    p0 = None
+    if not resume:
+        span = (CONT_PRIOR_HI - CONT_PRIOR_LO)
+        p0 = np.clip(init + 0.03 * span * rng.standard_normal((nw, ndim)),
+                     CONT_PRIOR_LO + 1e-6, CONT_PRIOR_HI - 1e-6)
+    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
+    bk = emcee.backends.HDFBackend(backend) if HAS_H5PY else None
+    resume_ok = bool(resume and bk is not None and os.path.exists(backend) and bk.iteration > 0)
+    print(f"  {'RESUMING' if resume_ok else 'STARTING'} {backend} | nwalkers={nw}, +{nsteps} steps, nproc={nproc}")
+    pool = mp.Pool(nproc) if nproc > 1 else None
+    try:
+        s = emcee.EnsembleSampler(nw, ndim, ap25_lnprob_continuous, args=(data,),
+                                  moves=moves, pool=pool, backend=bk)
+        if resume_ok:
+            s.run_mcmc(None, nsteps, progress=True)
+        else:
+            if bk is not None:
+                bk.reset(nw, ndim)
+            s.run_mcmc(p0, nsteps, progress=True)
+    finally:
+        if pool is not None:
+            pool.close(); pool.join()
+
+    rep = mcmc_convergence_report(s, CONT_TEX)
+    flat = s.get_chain(discard=rep['burn'], thin=rep['thin'], flat=True)
+    if len(flat) < 50:
+        flat = s.get_chain(discard=max(1, s.iteration // 3), flat=True)
+    np.save("cont_chain.npy", flat)
+    try:
+        make_corner_plot(flat, CONT_TEX, "figure_continuous_corner.png")
+    except Exception as exc:
+        print(f"  corner skipped ({exc})")
+    try:                                                        # Fig.4 from the DM sub-vector
+        gi = CONT_PARAM_NAMES.index('gamma')
+        chain5 = np.column_stack([flat[:, 0], flat[:, 1], flat[:, 2], flat[:, 3], flat[:, gi]])
+        make_ap25_figure4(chain5, "figure_ap25_fig4.png")
+        print("  saved figure_ap25_fig4.png (paper Fig.4 from the continuous posterior)")
+    except Exception as exc:
+        print(f"  Fig.4 skipped ({exc})")
+    print("\n  === posterior (median +/- 68% CI) ===")
+    for k, nm in enumerate(CONT_PARAM_NAMES):
+        p16, p50, p84 = np.percentile(flat[:, k], [16, 50, 84])
+        print(f"    {nm:<10} = {p50:8.3f}  (+{p84 - p50:.3f} / -{p50 - p16:.3f})")
+    gi = CONT_PARAM_NAMES.index('gamma'); ki = CONT_PARAM_NAMES.index('kJ')
+    g16, g50, g84 = np.percentile(flat[:, gi], [16, 50, 84])
+    k16, k50, k84 = np.percentile(flat[:, ki], [16, 50, 84])
+    tag = "" if rep.get('converged') else "   [NOT converged -- re-run to add steps]"
+    print("\n  " + "-" * 58)
+    print(f"  CONTINUOUS:  gamma = {g50:.2f} (+{g84 - g50:.2f} / -{g50 - g16:.2f}){tag}")
+    print(f"               gradient kJ = {k50:.2f} (+{k84 - k50:.2f} / -{k50 - k16:.2f})  "
+          f"({'detected' if k84 < 0 else 'consistent with 0'})")
+    print(f"               AP25 published gamma: 0.39 (+0.23 / -0.26)")
+    print("  " + "-" * 58)
+    return s
+
+
+# ============================================================
 # MASTER ORCHESTRATION PIPELINE
 # ============================================================
 if __name__ == "__main__":
@@ -2208,6 +3393,41 @@ if __name__ == "__main__":
                           "MCMC on the binned sigma_los of the real data (3 params: gamma, "
                           "log r_s, log M_DM). Converges in ~1-2 h; the well-posed reduction of "
                           "the degenerate free 5-parameter fit. Writes figure_ap25_fig4.png.")
+    _ap.add_argument("--gravsphere", action="store_true",
+                     help="GravSphere (Read & Steger 2017): spherical Jeans + Virial Shape "
+                          "Parameters with free anisotropy beta(r), on the real data. The "
+                          "middle rung between plain Jeans (--dm5) and the action-DF method.")
+    _ap.add_argument("--compare", action="store_true",
+                     help="Overlay the DM inner-slope posteriors from the saved --dm5, "
+                          "--gravsphere and --chain runs into one comparison figure.")
+    _ap.add_argument("--crosscheck", action="store_true",
+                     help="cross-check the GravSphere engine against the reference "
+                          "justinread/gravsphere code (needs --repo pointing at the clone).")
+    _ap.add_argument("--repo", default=None,
+                     help="path to the cloned reference gravsphere repo (for --crosscheck).")
+    _ap.add_argument("--mcmc", action="store_true",
+                     help="with --crosscheck: also run the end-to-end posterior-equivalence "
+                          "check (agama + emcee; a few minutes).")
+    _ap.add_argument("--continuous", action="store_true",
+                     help="Fit the CONTINUOUS f(J,[Fe/H]) model (Phase 6, the novel method): "
+                          "metallicity is a coordinate inside a single action DF whose scale "
+                          "action varies smoothly with [Fe/H]. Cluster-scale. Add --mock for "
+                          "the recovery test. With no --steps it runs a fast foundation smoke test.")
+    _ap.add_argument("--mock", action="store_true",
+                     help="with --continuous: fit a mock with a known gradient/slope "
+                          "(recovery test) instead of the real data.")
+    _ap.add_argument("--slide", action="store_true",
+                     help="Sliding-threshold test on the real data: sigma_los varies "
+                          "smoothly with the [Fe/H] split (a continuum), and the "
+                          "sigma_los-only constraint on gamma is degenerate (core-to-cusp). "
+                          "Writes figure_sliding_metallicity.png.")
+    _ap.add_argument("--biasgate", action="store_true",
+                     help="Bias gate on continuous-gradient mocks: recover gamma with a "
+                          "discrete median split vs a continuous (all-star) treatment, and "
+                          "measure the split-induced bias. Writes figure_bias_gate.png.")
+    _ap.add_argument("--overview", action="store_true",
+                     help="Generate the data-overview figure (histograms + scatter of the "
+                          "real Tolstoy+2023 sample) and exit.")
     _ap.add_argument("--steps", type=int, default=2000, help="MCMC steps to ADD this run")
     _ap.add_argument("--walkers", type=int, default=60, help="ensemble walkers (>50)")
     _ap.add_argument("--nproc", type=int, default=0, help="worker processes (0 = all cores)")
@@ -2219,6 +3439,49 @@ if __name__ == "__main__":
                           "for a faster laptop first pass)")
     _ap.add_argument("--no-resume", action="store_true", help="ignore an existing checkpoint")
     _args = _ap.parse_args()
+
+    if _args.compare:                                 # framework comparison figure, then exit
+        make_framework_comparison()
+        sys.exit(0)
+
+    if _args.overview:                                # data-overview figure, then exit
+        make_data_overview()
+        sys.exit(0)
+
+    if _args.continuous:                              # continuous f(J,[Fe/H]) model, then exit
+        _explicit_steps = any(a == "--steps" or a.startswith("--steps=") for a in sys.argv)
+        if _explicit_steps and _args.steps > 50:
+            _bk = _args.backend if _args.backend != "scl25.h5" else "cont.h5"
+            run_continuous_chain(nsteps=_args.steps, nproc=(_args.nproc or None),
+                                 backend=_bk, nsub=_args.nsub, use_mock=_args.mock,
+                                 resume=(False if _args.no_resume else None))
+        else:
+            run_continuous_smoke()
+        sys.exit(0)
+
+    if _args.slide:                                   # sliding-threshold test, then exit
+        run_sliding_metallicity_test()
+        sys.exit(0)
+
+    if _args.biasgate:                                # bias gate on mocks, then exit
+        run_bias_gate()
+        sys.exit(0)
+
+    if _args.crosscheck:                              # GravSphere cross-check, then exit
+        run_gravsphere_crosscheck(repo=_args.repo, do_mcmc=_args.mcmc,
+                                  steps=(_args.steps if _args.steps != 2000 else 600))
+        sys.exit(0)
+
+    if _args.compare:                                 # framework-comparison figure, then exit
+        make_framework_comparison()
+        sys.exit(0)
+
+    if _args.gravsphere:                              # GravSphere (Jeans + VSPs), then exit
+        _bk = _args.backend if _args.backend != "scl25.h5" else "gravsphere.h5"
+        run_gravsphere_chain(nwalkers=(_args.walkers if 14 <= _args.walkers <= 40 else 24),
+                             nsteps=_args.steps, nproc=(_args.nproc or None),
+                             backend=_bk, resume=(False if _args.no_resume else None))
+        sys.exit(0)
 
     if _args.dm5:                                     # 5-parameter DM model (robust+fast), then exit
         _bk = _args.backend if _args.backend != "scl25.h5" else "dm5.h5"

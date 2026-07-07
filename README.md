@@ -183,7 +183,7 @@ using the Mg spectral index W′ as the metallicity separator (as WP11 did), D =
 
 ---
 
-## References
+## Catalogs
 
 - Tolstoy et al. (2023), *A&A* 675, A49
 - Walker & Peñarrubia (2011), *ApJ* 742, 20

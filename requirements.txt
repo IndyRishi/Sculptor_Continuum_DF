@@ -1,0 +1,17 @@
+# Core scientific stack for the Sculptor DM inner-slope pipeline
+# Python 3.11+ recommended. Install with:  pip install -r requirements.txt
+#
+# Note: AGAMA requires a C++ toolchain and GSL; if `pip install agama` fails,
+# see https://github.com/GalacticDynamics-Oxford/Agama for build instructions.
+
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+matplotlib>=3.7
+emcee>=3.1
+corner>=2.2
+astropy>=5.3
+astroquery>=0.4.6
+h5py>=3.8
+agama>=1.0
+diptest>=0.9          # optional: enables the Hartigan dip test in --overview/--slide

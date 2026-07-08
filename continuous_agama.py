@@ -4,11 +4,11 @@
 #  A Comparative Analysis of Spherical Jeans, GravSphere, and Action-Based
 #  Chemo-Dynamical Modeling
 #
-#  Author:  [YOUR NAME], [YOUR INSTITUTION]
-#  Contact: [YOUR EMAIL]
+#  Author:  Rishi Sanjeev, The Charter School of Wilmington
+#  Contact: rishsanjeev@gmail.com
 #  License: MIT  (see LICENSE)
 #
-#  Companion code for the paper (submitted to The Open Journal of Astrophysics).
+#  Companion code for the paper.
 #  Measures the dark-matter inner density slope of the Sculptor (and Fornax) dwarf
 #  spheroidal galaxies across four independent dynamical frameworks, and tests
 #  whether the standard two-population split biases the inferred slope. All analyses

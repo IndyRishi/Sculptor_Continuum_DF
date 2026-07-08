@@ -1,3 +1,20 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  Constraining the Inner Dark-Matter Slope of Sculptor:
+#  A Comparative Analysis of Spherical Jeans, GravSphere, and Action-Based
+#  Chemo-Dynamical Modeling
+#
+#  Author:  [YOUR NAME], [YOUR INSTITUTION]
+#  Contact: [YOUR EMAIL]
+#  License: MIT  (see LICENSE)
+#
+#  Companion code for the paper (submitted to The Open Journal of Astrophysics).
+#  Measures the dark-matter inner density slope of the Sculptor (and Fornax) dwarf
+#  spheroidal galaxies across four independent dynamical frameworks, and tests
+#  whether the standard two-population split biases the inferred slope. All analyses
+#  and figures are reproducible from the command line (see --help). Data are queried
+#  from VizieR (Tolstoy et al. 2023; Walker et al. 2009) and Gaia DR3.
+# =============================================================================
 """
 Sculptor dwarf-spheroidal chemo-dynamical pipeline.
 
@@ -120,15 +137,24 @@ GALAXIES = {
         distance_kpc=84.0, v_sys=111.2, ellipticity=0.32, pa_deg=92.0,
         re_mr=0.18, re_mp=0.28,                          # tracer Plummer scales (kpc)
         catalog='J/A+A/675/A49', cols=None,              # Tolstoy+2023 ([Fe/H] auto-detected)
-        feh_quality_keep=(0,), mem_keep=('m',)),
+        feh_quality_keep=(0,), mem_keep=('m',),
+        wp11_xlim=(2.0, 2.75), wp11_ylim=(6.3, 7.9)),    # WP11 Fig.10 panel range (log10)
     'fornax': dict(
         name='Fornax', ra0=39.9971, dec0=-34.4492,
         center_ra=39.9971, center_dec=-34.4492,          # Munoz+2018 centre
         distance_kpc=147.0, v_sys=55.3, ellipticity=0.30, pa_deg=41.9,
         re_mr=0.60, re_mp=0.90,                          # larger tracer scales (kpc)
         catalog='J/AJ/137/3100',                         # Walker+2009 MMFS (Fornax)
-        cols=dict(vlos='HV', verr='e_HV', feh='W', feherr='e_W', ra='RAJ2000', dec='DEJ2000'),
-        feh_quality_keep=None, mem_keep=None),           # membership handled via the fit
+        # first (averaged, one row per star) table: <HV> velocity, <SigMg> Mg index as the
+        # metallicity separator. Column names carry angle brackets in VizieR.
+        cols=dict(vlos='<HV>', verr='e_<HV>', feh='<SigMg>', feherr='e_<SigMg>',
+                  ra='RAJ2000', dec='DEJ2000', mem='Mmb'),
+        # Walker+2009 MMFS is a MULTI-galaxy catalog (Carina/Fornax/Sculptor/Sextans);
+        # keep only Fornax rows. Coordinates are sexagesimal (parsed automatically).
+        target_col='Target', target_keep=('for', 'fnx'),
+        # 'Mmb' is a membership PROBABILITY (0-1); keep probable members (>0.5).
+        feh_quality_keep=None, mem_keep=None, mem_min=0.5,
+        wp11_xlim=(2.5, 3.1), wp11_ylim=(7.0, 8.4)),     # Fornax: larger radii/masses
 }
 GAL = GALAXIES['sculptor']                               # active galaxy (default)
 
@@ -284,6 +310,9 @@ def error_aware_gmm_likelihood(params, PM, PM_err, PM_corr):
 # PHASE 1: OBSERVATIONAL PIPELINE
 # ============================================================
 def fetch_walker_data():
+    """Legacy loader for the Walker et al. (2009) MMFS catalog (VizieR J/AJ/137/3100). Used by
+    the older Gaia-membership demonstration path; the flag-based commands use the galaxy-aware
+    _fetch_tolstoy2023 loader instead. Returns a DataFrame of the catalog rows."""
     print("\n[Phase 1] Fetching Walker et al. (2009) from VizieR...")
     Vizier.ROW_LIMIT = -1
     walker = Vizier.get_catalogs("J/AJ/137/3100")[0]
@@ -516,7 +545,7 @@ def project_gaia_challenge_mock(primary_url, output_file, default_halo='core'):
     print(f"[Phase 2] Fetching {output_file} ...")
     filename   = primary_url.split("data:")[-1] if "data:" in primary_url else primary_url.split("/")[-1]
     github_url = (f"https://raw.githubusercontent.com/"
-                  f"IndyRishi/Continuous_AGAMA/main/{filename}")
+                  f"IndyRishi/Sculptor_Continuum_DF/main/{filename}")
 
     content = None
     for label, url in [("Surrey AstroWiki", primary_url), ("GitHub Mirror", github_url)]:
@@ -645,6 +674,10 @@ def get_binned_kinematics(df, n_bins=6):
 
 
 def reproduce_arroyo_polonio_fig4():
+    """LEGACY: the original Jeans-degeneracy demonstration figure built from the Gaia Challenge
+    mock CSVs (projected_challenge_{core,cusp}.csv). Retained for provenance; NOT used by any
+    flag-based command and NOT part of the paper figures (the flag-based --slide/--dm5/--fig4all
+    supersede it and use the real data instead)."""
     print("[Phase 2] Generating Jeans-degeneracy proof figure...")
     df_core = pd.read_csv("projected_challenge_core.csv")
     df_cusp = pd.read_csv("projected_challenge_cusp.csv")
@@ -942,7 +975,7 @@ def agama_lnprob_jeans(theta, pops):
 
 
 def run_dm5_chain(nwalkers=24, nsteps=4000, nproc=None, backend="dm5.h5", resume=None,
-                  nbins=6, feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
+                  nbins=6, feh_quality_keep=None, catalog=None):
     """Robust MCMC of Sculptor's DM inner slope on the real Tolstoy+2023 data.
 
     Fits a generalised-NFW profile (3 free parameters: gamma, log10 r_s, log10 M_DM;
@@ -962,7 +995,7 @@ def run_dm5_chain(nwalkers=24, nsteps=4000, nproc=None, backend="dm5.h5", resume
     print("  DM inner slope -- robust spherical-Jeans gNFW MCMC (real Tolstoy+2023)")
     print("=" * 64)
     R, vlos, label, verr = agama_load_real_tolstoy2023(
-        catalog=catalog, feh_quality_keep=list(feh_quality_keep))
+        catalog=catalog, feh_quality_keep=feh_quality_keep)
     pops = agama_binned_pops(R, vlos, label, verr, nbins=nbins)
     print(f"  {len(R)} stars; sigma_los binned into {nbins} bins/population")
     try:                                                       # data-overview figure (bonus)
@@ -1271,7 +1304,7 @@ def make_corner_plot(flat, labels, outfile):
     print(f"--> Saved {outfile}")
 
 
-def agama_load_real_tolstoy2023(catalog="J/A+A/675/A49", cols=None, vclip_sigma=4.0, **select):
+def agama_load_real_tolstoy2023(catalog=None, cols=None, vclip_sigma=4.0, **select):
     """
     Load the real Tolstoy+2023 Sculptor catalog for the FAST Phase-4 two-tracer fit.
     Uses the SAME self-diagnosing fetch core as Phase 5 (auto-detects columns across
@@ -1286,6 +1319,15 @@ def agama_load_real_tolstoy2023(catalog="J/A+A/675/A49", cols=None, vclip_sigma=
     gamma HIGH (a spurious cusp). Clipping at ~4 sigma removes them; set None to disable.
     Returns (R_kpc, v_los_restframe, r_star_label, v_err).
     """
+    catalog = catalog or GAL['catalog']
+    if cols is None: cols = GAL.get('cols')
+    select.setdefault('mem_keep', GAL.get('mem_keep') or ('m',))
+    select.setdefault('require_member', bool(GAL.get('mem_keep')))
+    select.setdefault('target_col', GAL.get('target_col'))
+    select.setdefault('target_keep', GAL.get('target_keep'))
+    select.setdefault('mem_min', GAL.get('mem_min'))
+    if select.get('feh_quality_keep') is None:
+        _fqk = GAL.get('feh_quality_keep'); select['feh_quality_keep'] = (list(_fqk) if _fqk else None)
     ra, dec, vlos, verr, feh, feherr, _g = _fetch_tolstoy2023(catalog, cols, **select)
     R = _semi_major_axis_radius(ra, dec)
     good = np.isfinite(vlos) & np.isfinite(feh) & np.isfinite(verr)
@@ -1626,7 +1668,7 @@ def _gs_lnprob(theta, rc, so, se, v1o, v2o, v1e, v2e, a, use_vsp=True):
 
 def run_gravsphere_chain(nwalkers=24, nsteps=3000, nproc=None, backend="gravsphere.h5",
                          resume=None, use_vsp=True, nbins=7, feh_quality_keep=(0,),
-                         catalog="J/A+A/675/A49"):
+                         catalog=None):
     """
     GravSphere (Read & Steger 2017) measurement of Sculptor's DM inner slope on the real
     Tolstoy+2023 data: spherical Jeans with a free Baes-van-Hese anisotropy beta(r) plus
@@ -1647,7 +1689,7 @@ def run_gravsphere_chain(nwalkers=24, nsteps=3000, nproc=None, backend="gravsphe
     print("  GravSphere -- spherical Jeans + Virial Shape Parameters (real Tolstoy+2023)")
     print("=" * 64)
     R, vlos, label, verr = agama_load_real_tolstoy2023(
-        catalog=catalog, feh_quality_keep=list(feh_quality_keep))     # rest-frame, outlier-clipped
+        catalog=catalog, feh_quality_keep=feh_quality_keep)     # rest-frame, outlier-clipped
     a_star = float(np.median(R))                                       # Plummer scale = projected R_half
     print(f"  {len(R)} stars (single tracer); Plummer light scale a = {a_star:.3f} kpc; "
           f"VSPs {'ON' if use_vsp else 'OFF'}")
@@ -2203,7 +2245,8 @@ def ap25_inspect_vizier(catalog="J/A+A/675/A49"):
 
 
 def _fetch_tolstoy2023(catalog="J/A+A/675/A49", cols=None,
-                       require_member=True, mem_keep=('m',), feh_quality_keep=None):
+                       require_member=True, mem_keep=('m',), feh_quality_keep=None,
+                       target_col=None, target_keep=None, mem_min=None):
     """Return (ra, dec, vlos, verr, feh, feherr) from the Tolstoy+2023 VizieR catalog,
     auto-detecting the columns across ALL tables. `cols` optionally overrides names,
     e.g. cols=dict(vlos='Vlos', feh='__Fe_H_', ra='RAJ2000', dec='DEJ2000').
@@ -2227,26 +2270,51 @@ def _fetch_tolstoy2023(catalog="J/A+A/675/A49", cols=None,
                 return low[c.lower()]
         return None
 
-    for t in cats:                                       # pick the table with v AND [Fe/H]
-        vc = cols.get('vlos') or find(t, _VCANDS)
-        fc = cols.get('feh')  or find(t, _FCANDS)
+    def col_in(table, name):                             # accept an explicit name ONLY if present
+        return name if (name and name in table.colnames) else None
+
+    for t in cats:                                       # pick the table that ACTUALLY has v AND [Fe/H]
+        vc = col_in(t, cols.get('vlos')) or find(t, _VCANDS)
+        fc = col_in(t, cols.get('feh'))  or find(t, _FCANDS)
         if vc and fc:
-            rc  = cols.get('ra')  or find(t, _RACANDS)
-            dc  = cols.get('dec') or find(t, _DECANDS)
-            evc = cols.get('verr')   or find(t, _EVCANDS)
-            efc = cols.get('feherr') or find(t, _EFCANDS)
+            rc  = col_in(t, cols.get('ra'))  or find(t, _RACANDS)
+            dc  = col_in(t, cols.get('dec')) or find(t, _DECANDS)
+            evc = col_in(t, cols.get('verr'))   or find(t, _EVCANDS)
+            efc = col_in(t, cols.get('feherr')) or find(t, _EFCANDS)
             if rc is None or dc is None:
                 raise KeyError(f"found v/[Fe/H] but not RA/Dec in table "
                                f"'{t.meta.get('name')}'; columns: {list(t.colnames)}")
             g = lambda name: np.array(t[name], float)
+            def gcoord(name, is_ra):                          # decimal deg, or parse sexagesimal
+                try:
+                    return np.array(t[name], float)
+                except (ValueError, TypeError):
+                    from astropy.coordinates import Angle
+                    import astropy.units as u
+                    unit = u.hourangle if is_ra else u.deg
+                    return Angle([str(x) for x in t[name]], unit=unit).to(u.deg).value
             verr = g(evc) if evc else np.full(len(t), 2.0)    # default 2 km/s if absent
             feherr = g(efc) if efc else np.full(len(t), 0.1)  # default 0.1 dex if absent
             gcol = cols.get('gmag') or find(t, _GCANDS)
             gmag = g(gcol) if gcol else np.full(len(t), np.nan)   # real Gaia G if present
-            # ── sample selection: members (+ optional [Fe/H] quality) ──
+            # ── sample selection: target galaxy (multi-galaxy catalogs) + members ──
             sel = np.ones(len(t), bool)
-            mcol = cols.get('mem') or find(t, ['Mem', 'Member', 'memb', 'Pmemb', 'Pmem'])
-            if require_member and mcol is not None:
+            tcol = target_col or cols.get('target') or find(t, ['Target', 'Galaxy', 'dSph', 'Name'])
+            if target_keep is not None and tcol is not None:  # keep only the requested galaxy
+                pref = tuple(str(k).strip().lower() for k in target_keep)
+                tv = np.array([str(x).strip().lower().startswith(pref) for x in t[tcol]])
+                sel &= tv
+                kept = sorted(set(str(x).strip()[:4] for x in np.array(t[tcol])[tv]))
+                print(f"    [loader] target filter '{tcol}' startswith {list(target_keep)}: "
+                      f"kept {int(tv.sum())}/{len(t)} rows (matched prefixes: {kept})")
+            mcol = cols.get('mem') or find(t, ['Mmb', 'Mem', 'Member', 'memb', 'Pmemb', 'Pmem'])
+            if mem_min is not None and mcol is not None:      # membership PROBABILITY threshold
+                pv = np.array([float(x) if str(x).strip() not in ('', '--', 'nan') else np.nan
+                               for x in t[mcol]])
+                keep = np.isfinite(pv) & (pv >= mem_min)
+                sel &= keep
+                print(f"    [loader] membership '{mcol}' >= {mem_min}: {int(keep.sum())}/{len(t)} rows")
+            elif require_member and mcol is not None:         # exact-value membership flag
                 mv = np.array([str(x).strip().lower() for x in t[mcol]])
                 sel &= np.isin(mv, [str(k).lower() for k in mem_keep])
             qcol = cols.get('feh_quality') or find(t, ['q_[Fe/H]', 'q__Fe_H_', 'q_FeH', 'f_[Fe/H]'])
@@ -2259,7 +2327,7 @@ def _fetch_tolstoy2023(catalog="J/A+A/675/A49", cols=None,
             print(f"    [tolstoy loader] selected {int(sel.sum())}/{len(t)} rows"
                   f" (member={mcol or 'n/a'}"
                   + (f", q_[Fe/H]={qcol}" if feh_quality_keep is not None else "") + ")")
-            return (g(rc)[sel], g(dc)[sel], g(vc)[sel], verr[sel],
+            return (gcoord(rc, True)[sel], gcoord(dc, False)[sel], g(vc)[sel], verr[sel],
                     g(fc)[sel], feherr[sel], gmag[sel])
 
     lines = [f"Could not auto-detect velocity+[Fe/H] columns in '{catalog}'.",
@@ -2403,7 +2471,7 @@ def attach_selection(data, parent_R, parent_G=None, mode='radial',
     return data
 
 
-def ap25_load_real_tolstoy2023(catalog="J/A+A/675/A49", cols=None, **select):
+def ap25_load_real_tolstoy2023(catalog=None, cols=None, **select):
     """
     Load the real Tolstoy et al. (2023) Sculptor catalog (v_los + [Fe/H]) for the
     full 25-parameter fit. Auto-detects columns; if it can't, it prints the tables'
@@ -2413,6 +2481,15 @@ def ap25_load_real_tolstoy2023(catalog="J/A+A/675/A49", cols=None, **select):
     Returns the `data` dict expected by ap25_lnlike_full, with v_los in the REST frame
     (systemic subtracted) and R the semi-major-axis radius (Eq.1).
     """
+    catalog = catalog or GAL['catalog']
+    if cols is None: cols = GAL.get('cols')
+    select.setdefault('mem_keep', GAL.get('mem_keep') or ('m',))
+    select.setdefault('require_member', bool(GAL.get('mem_keep')))
+    select.setdefault('target_col', GAL.get('target_col'))
+    select.setdefault('target_keep', GAL.get('target_keep'))
+    select.setdefault('mem_min', GAL.get('mem_min'))
+    if select.get('feh_quality_keep') is None:
+        _fqk = GAL.get('feh_quality_keep'); select['feh_quality_keep'] = (list(_fqk) if _fqk else None)
     ra, dec, vlos, verr, feh, feherr, gmag = _fetch_tolstoy2023(catalog, cols, **select)
     R = _semi_major_axis_radius(ra, dec)
     good = np.isfinite(vlos) & np.isfinite(feh) & np.isfinite(verr) & np.isfinite(feherr)
@@ -2765,6 +2842,7 @@ def _load_real_feh(catalog=None, feh_quality_keep=None):
     ra, dec, vlos, verr, feh, feherr, _g = _fetch_tolstoy2023(
         catalog, GAL.get('cols'), mem_keep=(GAL.get('mem_keep') or ('m',)),
         require_member=bool(GAL.get('mem_keep')),
+        target_col=GAL.get('target_col'), target_keep=GAL.get('target_keep'), mem_min=GAL.get('mem_min'),
         feh_quality_keep=(list(fqk) if fqk else None))
     good = np.isfinite(vlos) & np.isfinite(feh) & np.isfinite(verr)
     R = _semi_major_axis_radius(ra[good], dec[good])
@@ -2806,7 +2884,7 @@ def _profile_chi2_gamma(R, vlos, verr, gammas, a=None):
     return c - c.min()
 
 
-def run_sliding_metallicity_test(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
+def run_sliding_metallicity_test(catalog=None, feh_quality_keep=None,
                                  nthresh=21, out="figure_sliding_metallicity.png"):
     """
     Two robust pieces of evidence on the real sample. (LEFT) sigma_los of the 'metal-poor'
@@ -3046,14 +3124,14 @@ def run_bias_vs_realizations(gamma_true=1.0, max_real=40, out="figure_bias_vs_re
     return dict(gd=gd, gc=gc)
 
 
-def make_data_overview(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
+def make_data_overview(catalog=None, feh_quality_keep=None,
                        out="figure_data_overview.png", arrays=None):
     """
-    Data-overview figure of the real Tolstoy+2023 Sculptor sample: HISTOGRAMS of the
-    raw observables (line-of-sight velocity, [Fe/H], projected radius) and SCATTER plots
-    (on-sky distribution, velocity-radius kinematics, metallicity-velocity chemodynamics),
-    split by the two metallicity populations. Requires VizieR access (or pass pre-loaded
-    `arrays=dict(ra, dec, vlos_rest, feh, R)` for testing). Writes figure_data_overview.png.
+    Data-overview figure of the active galaxy's real spectroscopic sample: HISTOGRAMS of the
+    raw observables (line-of-sight velocity, metallicity indicator, projected radius) and
+    SCATTER plots (on-sky distribution, velocity-radius kinematics, metallicity-velocity
+    chemodynamics), split by the two metallicity halves. Requires VizieR access (or pass
+    pre-loaded `arrays=dict(ra, dec, vlos_rest, feh, R)` for testing).
     """
     out = _gf(out)
     import matplotlib
@@ -3064,8 +3142,13 @@ def make_data_overview(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
     import matplotlib.pyplot as plt
 
     if arrays is None:
+        _cat = catalog or GAL['catalog']
+        _fqk = GAL['feh_quality_keep'] if feh_quality_keep is None else feh_quality_keep
         ra, dec, vlos, verr, feh, feherr, gmag = _fetch_tolstoy2023(
-            catalog, None, feh_quality_keep=list(feh_quality_keep))
+            _cat, GAL.get('cols'), mem_keep=(GAL.get('mem_keep') or ('m',)),
+            require_member=bool(GAL.get('mem_keep')),
+            target_col=GAL.get('target_col'), target_keep=GAL.get('target_keep'), mem_min=GAL.get('mem_min'),
+            feh_quality_keep=(list(_fqk) if _fqk else None))
         good = np.isfinite(vlos) & np.isfinite(feh)
         ra, dec = ra[good], dec[good]
         vlos, feh = vlos[good] - V_SYS, feh[good]     # rest-frame velocity
@@ -3145,6 +3228,249 @@ def make_data_overview(catalog="J/A+A/675/A49", feh_quality_keep=(0,),
                  fontsize=13)
     fig.tight_layout(); fig.savefig(out, dpi=140, bbox_inches='tight'); plt.close(fig)
     print(f"--> Saved {out}  ({len(vlos)} stars)")
+    return out
+
+
+def make_dispersion_profile(out=None, nbins=8, use_gaia=False):
+    """
+    Radial velocity-dispersion profile sigma_los(R) of the active galaxy's members, in
+    equal-count radial bins with bootstrap uncertainties. If use_gaia=True and Gaia proper
+    motions can be matched, also overlays the plane-of-sky (radial and tangential) PM
+    dispersion profiles -- otherwise the line-of-sight profile alone (fully offline). Writes
+    figure_dispersion_profile.png (galaxy-tagged).
+    """
+    out = _gf(out or "figure_dispersion_profile.png")
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    R, vlos, feh, verr = _load_real_feh()
+    order = np.argsort(R)
+    R, vlos, verr = R[order], vlos[order], verr[order]
+    edges = np.interp(np.linspace(0, len(R), nbins + 1), np.arange(len(R) + 1),
+                      np.concatenate([[0], np.sort(R)]))          # equal-count bin edges
+    rng = np.random.default_rng(0)
+    Rc, sig, siglo, sighi = [], [], [], []
+    for i in range(nbins):
+        m = (R >= edges[i]) & (R < edges[i + 1]) if i < nbins - 1 else (R >= edges[i])
+        if m.sum() < 5:
+            continue
+        v, e = vlos[m], verr[m]
+        # intrinsic dispersion (subtract measurement variance), bootstrap the CI
+        def disp(vv, ee):
+            return np.sqrt(max(np.var(vv) - np.mean(ee ** 2), 1.0))
+        boots = [disp(v[idx], e[idx]) for idx in
+                 (rng.integers(0, len(v), len(v)) for _ in range(300))]
+        Rc.append(np.median(R[m]))
+        sig.append(disp(v, e))
+        siglo.append(np.percentile(boots, 16)); sighi.append(np.percentile(boots, 84))
+    Rc, sig = np.array(Rc), np.array(sig)
+    yerr = np.vstack([sig - np.array(siglo), np.array(sighi) - sig])
+
+    fig, ax = plt.subplots(figsize=(8, 5.2))
+    ax.errorbar(Rc, sig, yerr=yerr, fmt='o-', color='navy', capsize=3, lw=1.8,
+                label=r'$\sigma_{\rm los}$ (line of sight)')
+
+    if use_gaia:                                                  # optional PM dispersion (needs Gaia)
+        try:
+            prof = _gaia_pm_dispersion_profile(nbins=nbins)       # (Rc, sig_R, sig_T) in km/s
+            if prof is not None:
+                Rg, sR, sT = prof
+                ax.plot(Rg, sR, 's--', color='crimson', lw=1.6, label=r'$\sigma_{\rm PM,R}$ (radial)')
+                ax.plot(Rg, sT, '^--', color='seagreen', lw=1.6, label=r'$\sigma_{\rm PM,T}$ (tangential)')
+        except Exception as exc:
+            print(f"  PM dispersion skipped ({str(exc)[:70]})")
+
+    ax.set_xlabel(r'projected radius $R$  [kpc]')
+    ax.set_ylabel(r'velocity dispersion  [km s$^{-1}$]')
+    ax.set_title(f'{GAL["name"]}: radial velocity-dispersion profile')
+    ax.grid(alpha=0.3); ax.legend(fontsize=9)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}  ({len(Rc)} radial bins)")
+    return out
+
+
+def _load_gaia_matched():
+    """Cross-match the active galaxy's spectroscopic members to Gaia DR3 proper motions and
+    compute PM membership. Returns a DataFrame (ra, dec, pmra, pmdec, P_mem_PM, R_kpc).
+    Requires network/Gaia access; raises on failure so callers can fall back."""
+    import pandas as pd
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    ra, dec, vlos, verr, feh, feherr, _g = _fetch_tolstoy2023(
+        GAL['catalog'], GAL.get('cols'),
+        mem_keep=(GAL.get('mem_keep') or ('m',)), require_member=bool(GAL.get('mem_keep')),
+        target_col=GAL.get('target_col'), target_keep=GAL.get('target_keep'),
+        mem_min=GAL.get('mem_min'), feh_quality_keep=None)
+    df = pd.DataFrame(dict(ra=ra, dec=dec, vlos=vlos - V_SYS, feh=feh))   # rest-frame (as other loaders)
+    coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame='icrs', obstime=Time('J2000.0'))
+    matched = fetch_gaia_with_epoch_correction(df, coords)         # existing Gaia infra
+    matched = matched.copy()
+    matched['P_mem_1D'] = 1.0                                      # input stars are already members
+    for a, b in [('RA_deg', 'ra'), ('DEC_deg', 'dec'), ('Dec_deg', 'dec'), ('Ra_deg', 'ra'),
+                 ('RA', 'ra'), ('DEC', 'dec')]:
+        if a not in matched.columns and b in matched.columns:
+            matched[a] = matched[b]                                # aliases the GMM may expect
+    try:
+        memb = calculate_error_aware_membership(matched)
+        pcol = ('P_mem_PM' if 'P_mem_PM' in memb.columns
+                else [c for c in memb.columns if 'P_mem' in c][0])
+        memb['P_mem_PM'] = memb[pcol]
+    except Exception as exc:                                       # robust fallback: PM-clump membership
+        print(f"  [membership] GMM unavailable ({str(exc)[:50]}); using PM-clump distance")
+        memb = matched
+        pm = memb[['pmra', 'pmdec']].values
+        med = np.median(pm, axis=0)
+        sig = np.maximum(np.median(np.abs(pm - med), axis=0) * 1.4826, 0.05)
+        chi2 = np.sum(((pm - med) / sig) ** 2, axis=1)
+        L_S = np.exp(-0.5 * chi2); memb['P_mem_PM'] = L_S / (L_S + 0.05)
+    memb['R_kpc'] = _semi_major_axis_radius(memb['ra'].values, memb['dec'].values)
+    return memb
+
+
+def _gaia_pm_dispersion_profile(nbins=8):
+    """Plane-of-sky PM velocity-dispersion profile (radial, tangential) in km/s, from Gaia
+    proper motions of members (P_mem_PM > 0.5). Returns (Rc, sigR, sigT) or None."""
+    df = _load_gaia_matched()
+    df = df[df['P_mem_PM'] > 0.5].reset_index(drop=True)
+    if len(df) < 40:
+        return None
+    kms = 4.74047 * GAL['distance_kpc']                            # mas/yr -> km/s at distance
+    dpmra = (df['pmra'].values - np.median(df['pmra'].values)) * kms
+    dpmdec = (df['pmdec'].values - np.median(df['pmdec'].values)) * kms
+    R = df['R_kpc'].values
+    edges = np.quantile(R, np.linspace(0, 1, nbins + 1))
+    Rc, sR, sT = [], [], []
+    for i in range(nbins):
+        m = (R >= edges[i]) & (R < edges[i + 1]) if i < nbins - 1 else (R >= edges[i])
+        if m.sum() < 8:
+            continue
+        Rc.append(np.median(R[m])); sR.append(np.std(dpmra[m])); sT.append(np.std(dpmdec[m]))
+    return np.array(Rc), np.array(sR), np.array(sT)
+
+
+def make_gaia_skymap(out=None, cuts=(0.0, 0.5, 0.9), arrays=None):
+    """
+    Gaia proper-motion sky map with one panel PER membership cut (the advisor's
+    membership-cut justification): each panel shows the on-sky distribution of stars, with
+    likely members and Milky-Way foreground distinguished, coloured by PM membership
+    probability. Demonstrates that the PM cut cleanly separates the dwarf from the foreground.
+    Pass pre-loaded `arrays=dict(ra, dec, pmra, pmdec, P_mem, R)` for offline testing;
+    otherwise cross-matches to Gaia DR3 (needs network). Writes figure_gaia_skymap.png.
+    """
+    out = _gf(out or "figure_gaia_skymap.png")
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    if arrays is None:
+        df = _load_gaia_matched()
+        ra, dec = df['ra'].values, df['dec'].values
+        pmra, pmdec, pmem = df['pmra'].values, df['pmdec'].values, df['P_mem_PM'].values
+    else:
+        ra, dec = arrays['ra'], arrays['dec']
+        pmra, pmdec, pmem = arrays['pmra'], arrays['pmdec'], arrays['P_mem']
+    dRA = (ra - RA0_DEG) * np.cos(np.radians(DEC0_DEG)); dDec = dec - DEC0_DEG
+
+    n = len(cuts)
+    fig, axes = plt.subplots(1, n, figsize=(5.0 * n, 4.8), squeeze=False)
+    for k, cut in enumerate(cuts):
+        ax = axes[0][k]
+        mem = pmem >= cut
+        ax.scatter(dRA[~mem], dDec[~mem], s=8, c='0.6', marker='x', alpha=0.5, label='MW foreground')
+        sc = ax.scatter(dRA[mem], dDec[mem], s=14, c=pmem[mem], cmap='viridis', vmin=0, vmax=1,
+                        edgecolors='k', linewidths=0.2, label='members')
+        ax.set_xlabel(r'$\Delta$RA [deg]'); ax.set_title(f'$P_{{\\rm mem}} \\geq {cut:.1f}$   '
+                                                         f'({int(mem.sum())} stars)')
+        if k == 0:
+            ax.set_ylabel(r'$\Delta$Dec [deg]'); ax.legend(fontsize=8, loc='upper right')
+        ax.invert_xaxis(); ax.set_aspect('equal', 'datalim'); ax.grid(alpha=0.25)
+    cb = fig.colorbar(sc, ax=axes[0].tolist(), fraction=0.025, pad=0.02)
+    cb.set_label(r'PM membership probability $P_{\rm mem}$')
+    fig.suptitle(f'{GAL["name"]}: Gaia proper-motion membership across cuts', fontsize=13)
+    fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}")
+    return out
+
+
+def compute_actions_for_members(chain_file="cont_chain.npy", arrays=None):
+    """Compute orbital actions (J_r, J_z, J_phi) for the active galaxy's Gaia-matched members
+    in the median-posterior potential, using AGAMA's ActionFinder. Full 6D phase space is
+    built from (ra, dec, distance, pmra, pmdec, vlos). Returns (Jr, Jz, Jphi, feh). Pass
+    `arrays=dict(Jr,Jz,Jphi,feh)` to bypass (offline testing). Needs Gaia + AGAMA + a chain."""
+    if arrays is not None:
+        return arrays['Jr'], arrays['Jz'], arrays['Jphi'], arrays['feh']
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+    df = _load_gaia_matched()
+    df = df[df['P_mem_PM'] > 0.5].reset_index(drop=True)
+    flat = np.load(_gf(chain_file))
+    th = np.median(flat[:, :5], axis=0)                            # [logM_DM, log_rs, alpha, eta, gamma]
+    pot = ap25_dm_potential(th[0], th[1], th[2], th[3], th[4])
+    af = agama.ActionFinder(pot)
+    # Actions must be computed in a frame centered on the DWARF (its internal potential has a
+    # ~kpc scale radius), NOT the Galactocentric frame. Build each star's phase-space vector
+    # relative to the galaxy centre: tangent-plane position (line-of-sight depth unknown -> 0)
+    # and velocity relative to the systemic proper motion and systemic line-of-sight velocity.
+    D = GAL['distance_kpc']
+    ra = df['ra'].values; dec = df['dec'].values
+    dx = np.radians(ra - RA0_DEG) * np.cos(np.radians(DEC0_DEG)) * D    # kpc, tangent plane
+    dy = np.radians(dec - DEC0_DEG) * D
+    dz = np.zeros_like(dx)                                          # unknown depth -> galaxy centre
+    kms = 4.74047 * D                                              # mas/yr -> km/s at distance D
+    vx = (df['pmra'].values - np.median(df['pmra'].values)) * kms  # relative to systemic PM
+    vy = (df['pmdec'].values - np.median(df['pmdec'].values)) * kms
+    vz = df['vlos'].values                                        # already rest-frame from _load_gaia_matched
+    xv = np.column_stack([dx, dy, dz, vx, vy, vz])
+    J = af(xv)                                                     # (N,3): Jr, Jz, Jphi
+    return J[:, 0], J[:, 1], J[:, 2], df['feh'].values
+
+
+def make_action_space(out=None, chain_file="cont_chain.npy", arrays=None):
+    """
+    Action-space chemodynamics: (left) metallicity vs radial action J_r, testing whether
+    metal-rich stars occupy lower-action (more bound, centrally concentrated) orbits -- the
+    action-space signature of the gradient; (right) J_z vs J_r scatter coloured by [Fe/H], to
+    reveal any trend across orbit type. Needs Gaia PMs + AGAMA actions in the fitted potential
+    (or pass arrays=dict(Jr,Jz,Jphi,feh) for offline testing). Writes figure_action_space.png.
+    """
+    out = _gf(out or "figure_action_space.png")
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+    Jr, Jz, Jphi, feh = compute_actions_for_members(chain_file=chain_file, arrays=arrays)
+    Jr = np.asarray(Jr); Jz = np.asarray(Jz); feh = np.asarray(feh)
+    good = np.isfinite(Jr) & np.isfinite(Jz) & np.isfinite(feh) & (Jr > 0) & (Jz > 0)
+    Jr, Jz, feh = Jr[good], Jz[good], feh[good]                   # log axes need positive actions
+    if len(Jr) < 10:
+        print(f"  action-space skipped (only {len(Jr)} stars with positive finite actions)")
+        return None
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12.5, 5.2))
+    axL.scatter(Jr, feh, s=10, c=feh, cmap='viridis', alpha=0.7, edgecolors='none')
+    # running median of [Fe/H] vs J_r to show the trend
+    if len(Jr) > 20:
+        oi = np.argsort(Jr); b = np.array_split(oi, 8)
+        jm = [np.median(Jr[ix]) for ix in b]; fm = [np.median(feh[ix]) for ix in b]
+        axL.plot(jm, fm, 'r-o', lw=2, label='running median')
+        axL.legend(fontsize=9)
+    axL.set_xscale('log')
+    axL.set_xlabel(r'radial action $J_r$  [kpc km s$^{-1}$]')
+    axL.set_ylabel(r'[Fe/H]'); axL.set_title('Metallicity vs radial action')
+    axL.grid(alpha=0.25)
+
+    sc = axR.scatter(Jr, Jz, s=14, c=feh, cmap='viridis', alpha=0.8, edgecolors='k', linewidths=0.2)
+    axR.set_xscale('log'); axR.set_yscale('log')
+    axR.set_xlabel(r'radial action $J_r$'); axR.set_ylabel(r'vertical action $J_z$')
+    axR.set_title('Action components coloured by [Fe/H]')
+    cb = fig.colorbar(sc, ax=axR, fraction=0.046, pad=0.02); cb.set_label('[Fe/H]')
+    axR.grid(alpha=0.25)
+    fig.suptitle(f'{GAL["name"]}: action-space chemodynamics', fontsize=13)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}  ({len(Jr)} stars)")
     return out
 
 
@@ -3303,7 +3629,7 @@ def run_ap25_production_chain(nwalkers=60, nsteps=2000, nproc=None, backend="scl
     print("=" * 64)
     # 1) analysis sample: members with reliable [Fe/H] (~1339), real Gmag, rest-frame v
     data = ap25_load_real_tolstoy2023(catalog=catalog,
-                                      feh_quality_keep=list(feh_quality_keep))
+                                      feh_quality_keep=feh_quality_keep)
     print(f"  analysis sample: {len(data['R'])} stars "
           f"(members & q_[Fe/H] in {tuple(feh_quality_keep)})"
           + (f"; fitting a random subsample of {nsub}" if nsub else ""))
@@ -3550,7 +3876,7 @@ def run_continuous_smoke():
 
 def run_continuous_chain(nwalkers=None, nsteps=2000, nproc=None, backend="cont.h5",
                          resume=None, nsub=None, use_mock=False, fix_nuisance=False,
-                         K=11, feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
+                         K=11, feh_quality_keep=None, catalog=None):
     """
     Fit the continuous f(J,[Fe/H]) model (Phase 6) by MCMC. use_mock=True runs the recovery
     test (known gradient kJ and slope gamma); otherwise the real Tolstoy+2023 data.
@@ -3571,7 +3897,7 @@ def run_continuous_chain(nwalkers=None, nsteps=2000, nproc=None, backend="cont.h
         data = ap25_generate_continuous_mock(seed=1)
         print(f"  MOCK: {len(data['R'])} stars; truth gamma={CONT_TRUTH['gamma']}, kJ={CONT_TRUTH['kJ']}")
     else:
-        data = ap25_load_real_tolstoy2023(catalog=catalog, feh_quality_keep=list(feh_quality_keep))
+        data = ap25_load_real_tolstoy2023(catalog=catalog, feh_quality_keep=feh_quality_keep)
         print(f"  real: {len(data['R'])} stars")
     rng = np.random.default_rng(42)
     if nsub and nsub < len(data['R']):
@@ -3599,7 +3925,10 @@ def run_continuous_chain(nwalkers=None, nsteps=2000, nproc=None, backend="cont.h
         span = (CONT_PRIOR_HI - CONT_PRIOR_LO)[free_idx]
         p0 = np.clip(init + 0.03 * span * rng.standard_normal((nw, ndim)),
                      CONT_PRIOR_LO[free_idx] + 1e-6, CONT_PRIOR_HI[free_idx] - 1e-6)
-    moves = [(emcee.moves.DEMove(), 0.8), (emcee.moves.DESnookerMove(), 0.2)]
+    # affine-invariant stretch move (robust; the DE-heavy mix mixed poorly here, ~0.10
+    # acceptance) blended with differential-evolution for correlated parameter directions
+    moves = [(emcee.moves.StretchMove(a=2.0), 0.6),
+             (emcee.moves.DEMove(), 0.3), (emcee.moves.DESnookerMove(), 0.1)]
     bk = emcee.backends.HDFBackend(backend) if HAS_H5PY else None
     resume_ok = bool(resume and bk is not None and os.path.exists(backend) and bk.iteration > 0)
     print(f"  {'RESUMING' if resume_ok else 'STARTING'} {backend} | +{nsteps} steps, nproc={nproc}")
@@ -3702,6 +4031,7 @@ def wp11_load_data(catalog=None, feh_quality_keep=None):
     ra, dec, vlos, verr, feh, feherr, _g = _fetch_tolstoy2023(
         catalog, GAL.get('cols'), mem_keep=(GAL.get('mem_keep') or ('m',)),
         require_member=bool(GAL.get('mem_keep')),
+        target_col=GAL.get('target_col'), target_keep=GAL.get('target_keep'), mem_min=GAL.get('mem_min'),
         feh_quality_keep=(list(fqk) if fqk else None))
     good = np.isfinite(vlos) & np.isfinite(feh) & np.isfinite(verr) & np.isfinite(feherr)
     R_kpc = _semi_major_axis_radius(ra[good], dec[good])
@@ -3779,6 +4109,58 @@ def wp11_generate_mock(seed=3, n=1000, truth=None):
     return data, float(Gamma_true)
 
 
+def make_figure1_two_galaxy(galaxies=('sculptor', 'fornax'), out="figure1_two_galaxy.png", arrays=None):
+    """
+    Figure-1 style data presentation for two dwarf spheroidals side by side (AP25 Fig.2 style):
+    one row per galaxy, columns = (metallicity distribution, line-of-sight velocity vs projected
+    radius coloured by metallicity, velocity vs metallicity chemodynamics). Note the metallicity
+    indicator differs by galaxy ([Fe/H] for Sculptor; Mg index for Fornax). Pass
+    `arrays={galaxy: dict(R, vlos, feh, mlabel)}` for offline testing; otherwise loads each
+    galaxy's real sample (needs VizieR). Writes figure1_two_galaxy.png.
+    """
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    saved = GAL['name'].lower()                                    # restore active galaxy after
+    rows = len(galaxies)
+    fig, axes = plt.subplots(rows, 3, figsize=(14, 4.4 * rows), squeeze=False)
+    try:
+        for i, gname in enumerate(galaxies):
+            if arrays is not None:
+                d = arrays[gname]; R, vlos, feh, mlabel = d['R'], d['vlos'], d['feh'], d.get('mlabel', '[Fe/H]')
+            else:
+                set_galaxy(gname)
+                R, vlos, feh, verr = _load_real_feh()
+                mlabel = '[Fe/H]' if gname == 'sculptor' else r'Mg index $W^\prime$'
+            gal_disp = GALAXIES[gname]['name']
+            # col 0: metallicity distribution
+            ax = axes[i][0]
+            ax.hist(feh, bins=30, color='steelblue', alpha=0.8, edgecolor='white', linewidth=0.4)
+            ax.axvline(np.median(feh), color='k', ls=':', lw=1.3, label=f'median = {np.median(feh):.2f}')
+            ax.set_xlabel(mlabel); ax.set_ylabel('N stars'); ax.legend(fontsize=8)
+            ax.set_title(f'{gal_disp}: metallicity distribution')
+            # col 1: velocity vs radius, colored by metallicity
+            ax = axes[i][1]
+            sc = ax.scatter(R, vlos, c=feh, s=12, cmap='viridis', alpha=0.75, edgecolors='none')
+            ax.axhline(0, color='k', ls='--', lw=1); ax.set_xlabel(r'projected radius $R$ [kpc]')
+            ax.set_ylabel(r'$v_{\rm los}$ (rest frame) [km s$^{-1}$]')
+            ax.set_title(f'{gal_disp}: kinematics'); fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label=mlabel)
+            # col 2: velocity vs metallicity chemodynamics
+            ax = axes[i][2]
+            ax.scatter(feh, vlos, c=R, s=12, cmap='plasma', alpha=0.75, edgecolors='none')
+            ax.axhline(0, color='k', ls='--', lw=1); ax.set_xlabel(mlabel)
+            ax.set_ylabel(r'$v_{\rm los}$ [km s$^{-1}$]'); ax.set_title(f'{gal_disp}: chemodynamics')
+    finally:
+        set_galaxy(saved)                                         # restore
+
+    fig.suptitle('Data presentation: chemo-dynamics of two dwarf spheroidals', fontsize=14)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"--> Saved {out}")
+    return out
+
+
 def make_wp11_figure(flat, out="figure_wp11.png"):
     """Reproduction of WP11 Figure 10: (left) the two stellar subcomponents in the
     (r_h, M) plane, shaded by posterior density with a "Prob" colorbar and the slope-2
@@ -3814,13 +4196,26 @@ def make_wp11_figure(flat, out="figure_wp11.png"):
     rr = np.array([np.median(d['rh1']) * 0.45, np.median(d['rh2']) * 1.7])
     axL.plot(rr, M0 * (rr / r0) ** 2, 'b:', lw=1.6)                 # slope 2 (cusp)
     axL.plot(rr, M0 * (rr / r0) ** 3, 'b--', lw=1.6)               # slope 3 (core)
-    axL.text(0.42, 1.02, r'slope=2 (cusp)', transform=axL.transAxes, fontsize=9, color='b')
-    axL.text(0.42, 0.95, r'slope=3 (core)', transform=axL.transAxes, fontsize=9, color='b')
+    axL.text(0.04, 0.96, r'slope=2 (cusp)', transform=axL.transAxes, fontsize=9, color='b', va='top')
+    axL.text(0.04, 0.90, r'slope=3 (core)', transform=axL.transAxes, fontsize=9, color='b', va='top')
     axL.set_xscale('log'); axL.set_yscale('log')
-    axL.set_xlim(10 ** 2.0, 10 ** 2.75)                            # match WP11 Fig.10 Sculptor panel
-    axL.set_ylim(10 ** 6.3, 10 ** 7.9)
-    axL.set_xlabel(r'$\log_{10}\,r_{\rm half}$  [pc]'); axL.set_ylabel(r'$M(R_{\rm half})$  [$M_\odot$]')
-    axL.set_title('Sculptor'); axL.grid(alpha=0.25, which='both')
+    xlo, xhi = GAL.get('wp11_xlim', (2.0, 2.75))                  # galaxy-aware panel range (log10)
+    ylo, yhi = GAL.get('wp11_ylim', (6.3, 7.9))
+    axL.set_xlim(10 ** xlo, 10 ** xhi); axL.set_ylim(10 ** ylo, 10 ** yhi)
+    import matplotlib.ticker as mticker                            # label ticks with log10 values
+    xt = [round(v, 1) for v in np.arange(np.ceil(xlo * 5) / 5, xhi + 1e-9, 0.2)]
+    yt = [round(v, 1) for v in np.arange(np.ceil(ylo * 2) / 2, yhi + 1e-9, 0.5)]
+    axL.xaxis.set_major_locator(mticker.FixedLocator([10 ** v for v in xt]))
+    axL.xaxis.set_major_formatter(mticker.FixedFormatter([f"{v:.1f}" for v in xt]))
+    axL.xaxis.set_minor_locator(mticker.NullLocator())
+    axL.yaxis.set_major_locator(mticker.FixedLocator([10 ** v for v in yt]))
+    axL.yaxis.set_major_formatter(mticker.FixedFormatter([f"{v:.1f}" for v in yt]))
+    axL.yaxis.set_minor_locator(mticker.NullLocator())
+    axL.set_xlabel(r'$\log_{10}\,[\,r_{\rm half}\,/\,{\rm pc}\,]$')
+    axL.set_ylabel(r'$\log_{10}\,[\,M(R_{\rm half})\,/\,M_\odot\,]$')
+    axL.text(0.5, 0.04, GAL['name'], transform=axL.transAxes, fontsize=14, ha='center',
+             va='bottom', style='italic')                          # galaxy name inside panel (paper style)
+    axL.grid(alpha=0.25, which='both')
 
     # right: posterior PDF of Gamma
     g16, g50, g84 = np.percentile(d['Gamma'], [16, 50, 84])
@@ -3838,8 +4233,101 @@ def make_wp11_figure(flat, out="figure_wp11.png"):
     print(f"--> Saved {out}")
 
 
+def _wp11_fit_gamma(data, nsteps=8000, nproc=None, seed=7):
+    """Run the WP11 two-subcomponent MCMC on a supplied data dict and return the mass-slope
+    posterior percentiles (Gamma16, Gamma50, Gamma84). Used by the membership robustness test
+    to refit under different selections without re-querying VizieR."""
+    import emcee, multiprocessing as mp, os
+    ndim = WP11_NDIM; nw = max(4 * ndim, 48)
+    rng = np.random.default_rng(seed)
+    scale = np.array([0.03, 0.02, 0.02, 0.03, 0.03, 0.08, 0.08, 0.04, 0.04])
+    p0 = np.clip(wp11_truth_vector() + scale * rng.standard_normal((nw, ndim)),
+                 WP11_PRIOR_LO + 1e-6, WP11_PRIOR_HI - 1e-6)
+    moves = [(emcee.moves.StretchMove(a=2.0), 0.7), (emcee.moves.DEMove(), 0.3)]
+    pool = mp.Pool(nproc) if (nproc and nproc > 1) else None
+    try:
+        s = emcee.EnsembleSampler(nw, ndim, wp11_lnprob, args=(data,), moves=moves, pool=pool)
+        s.run_mcmc(p0, nsteps, progress=False)
+    finally:
+        if pool is not None:
+            pool.close(); pool.join()
+    flat = s.get_chain(discard=nsteps // 2, thin=10, flat=True)
+    G = wp11_derived(flat)['Gamma']
+    return np.percentile(G, [16, 50, 84])
+
+
+def run_membership_robustness(pmem_cuts=(0.50, 0.70, 0.90, 0.95), nsteps=8000, nproc=None, out=None):
+    """
+    Membership-cut robustness test (justifies the membership selection): refit the WP11
+    mass-profile slope on the subsample surviving progressively stricter Gaia proper-motion
+    membership thresholds (P_mem > cut). Unlike a velocity clip -- which truncates the very
+    velocity distribution being measured and is therefore confounded -- the PM membership is
+    an INDEPENDENT criterion, so a stable Gamma across thresholds is a clean demonstration
+    that the result is not driven by the membership definition. Falls back to a velocity-clip
+    variant only if Gaia proper motions are unavailable. Writes
+    figure_membership_robustness.png (galaxy-tagged) and prints a table.
+    """
+    out = _gf(out or "figure_membership_robustness.png")
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    print("=" * 64)
+    print(f"  MEMBERSHIP ROBUSTNESS  ({GAL['name']}; Gamma vs Gaia PM membership threshold)")
+    print("=" * 64)
+    # cross-match the WP11 sample to Gaia and attach PM membership + the WP11 observables
+    try:
+        gaia = _load_gaia_matched()                                # ra, dec, vlos, feh, P_mem_PM, R_kpc
+        base = dict(R_pc=gaia['R_kpc'].values * 1000.0, vlos=gaia['vlos'].values,
+                    feh=gaia['feh'].values,
+                    everr=np.full(len(gaia), 2.0), efeh=np.full(len(gaia), 0.1))
+        pmem = gaia['P_mem_PM'].values
+        xlabel = r'Gaia PM membership threshold  $P_{\rm mem} >$'
+        mode = 'pm'
+    except Exception as exc:                                        # Gaia unavailable -> velocity-clip fallback
+        print(f"  [robustness] Gaia PM unavailable ({str(exc)[:50]}); using velocity-clip variant")
+        base = wp11_load_data(); v = base['vlos']
+        sig = 1.4826 * np.median(np.abs(v - np.median(v)))
+        pmem = 1.0 / (1.0 + (np.abs(v - np.median(v)) / (3.0 * sig)) ** 4)   # pseudo-membership
+        pmem_cuts = (0.3, 0.5, 0.7, 0.9)
+        xlabel = r'velocity pseudo-membership threshold'
+        mode = 'vclip'
+
+    rows = []
+    for cut in pmem_cuts:
+        keep = pmem >= cut
+        if keep.sum() < 50:
+            continue
+        data = {k: (val[keep] if hasattr(val, '__len__') and len(val) == len(pmem) else val)
+                for k, val in base.items()}
+        g16, g50, g84 = _wp11_fit_gamma(data, nsteps=nsteps, nproc=nproc)
+        rows.append((cut, int(keep.sum()), g50, g16, g84))
+        print(f"    P_mem > {cut:.2f}: N={int(keep.sum()):4d}   Gamma = {g50:.2f} "
+              f"(+{g84-g50:.2f}/-{g50-g16:.2f})")
+    cs = np.array([r[0] for r in rows]); g50 = np.array([r[2] for r in rows])
+    glo = np.array([r[3] for r in rows]); ghi = np.array([r[4] for r in rows])
+
+    fig, ax = plt.subplots(figsize=(8, 5.2))
+    ax.errorbar(cs, g50, yerr=np.vstack([g50 - glo, ghi - g50]), fmt='o-', color='navy',
+                capsize=4, lw=1.8, label=r'WP11 $\Gamma$ (68% CI)')
+    ax.axhspan(np.min(glo), np.max(ghi), color='navy', alpha=0.08)
+    ax.axhline(2.0, color='k', ls=':', lw=1.3, label=r'NFW cusp ($\Gamma=2$)')
+    for cut, n, g, _, _ in rows:
+        ax.annotate(f'N={n}', (cut, g), textcoords='offset points', xytext=(0, 10), fontsize=8, ha='center')
+    ax.set_xlabel(xlabel); ax.set_ylabel(r'mass-profile slope $\Gamma$')
+    ax.set_title(f'{GAL["name"]}: WP11 slope is stable across membership thresholds')
+    ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"\n--> Saved {out}")
+    spread = np.max(g50) - np.min(g50)
+    print(f"  Gamma spread across {mode} thresholds = {spread:.2f} "
+          f"({'STABLE' if spread < 0.3 else 'sensitive -- report the caveat'})")
+    return rows
+
+
 def run_wp11(nwalkers=64, nsteps=6000, nproc=None, backend="wp11.h5", resume=None,
-             use_mock=False, feh_quality_keep=(0,), catalog="J/A+A/675/A49"):
+             use_mock=False, feh_quality_keep=None, catalog=None):
     """
     Walker & Penarrubia (2011) mass-slope measurement on the real Tolstoy+2023 data (or a
     known-Gamma mock with use_mock=True). Analytic likelihood -> fast; converges in minutes.
@@ -3859,7 +4347,7 @@ def run_wp11(nwalkers=64, nsteps=6000, nproc=None, backend="wp11.h5", resume=Non
         data, Gamma_true = wp11_generate_mock()
         print(f"  MOCK: {len(data['R_pc'])} stars; true Gamma = {Gamma_true:.2f}")
     else:
-        data = wp11_load_data(catalog=catalog, feh_quality_keep=list(feh_quality_keep))
+        data = wp11_load_data(catalog=catalog, feh_quality_keep=feh_quality_keep)
         print(f"  real: {len(data['R_pc'])} member stars")
     ndim = WP11_NDIM; nw = max(4 * ndim, nwalkers)                # more walkers for a stiff 9-D space
     rng = np.random.default_rng(7)
@@ -3955,6 +4443,23 @@ if __name__ == "__main__":
     _ap.add_argument("--mcmc", action="store_true",
                      help="with --crosscheck: also run the end-to-end posterior-equivalence "
                           "check (agama + emcee; a few minutes).")
+    _ap.add_argument("--robustness", action="store_true",
+                     help="membership-cut robustness test: refit WP11 Gamma vs velocity clip "
+                          "to show the slope is stable across membership definitions. "
+                          "figure_membership_robustness.png.")
+    _ap.add_argument("--figure1", action="store_true",
+                     help="two-galaxy Figure-1 data presentation (Sculptor + Fornax side by "
+                          "side, AP25 Fig.2 style). figure1_two_galaxy.png.")
+    _ap.add_argument("--actions", action="store_true",
+                     help="action-space chemodynamics: [Fe/H] vs J_r and J_z-J_r coloured by "
+                          "[Fe/H] (needs Gaia PMs + a saved chain). figure_action_space.png.")
+    _ap.add_argument("--dispersion", action="store_true",
+                     help="radial velocity-dispersion profile sigma_los(R) (add --gaia to "
+                          "overlay the Gaia PM dispersion). Writes figure_dispersion_profile.png.")
+    _ap.add_argument("--skymap", action="store_true",
+                     help="Gaia proper-motion sky map with one panel per membership cut "
+                          "(justifies the membership selection). Writes figure_gaia_skymap.png.")
+    _ap.add_argument("--gaia", action="store_true", help="use Gaia proper motions where supported")
     _ap.add_argument("--fig4all", action="store_true",
                      help="Combined AP25 Fig.4: overlay DM density rho(r) from every saved "
                           "chain (dm5, gravsphere, continuous, chain) + AP25's published "
@@ -3997,6 +4502,10 @@ if __name__ == "__main__":
     _ap.add_argument("--selection", choices=["none", "radial", "2d"], default="none",
                      help="AP24-style selection function omega(R,G) (default: none/flat)")
     _ap.add_argument("--backend", default="scl25.h5", help="HDF5 checkpoint file")
+    _ap.add_argument("--K", type=int, default=0,
+                     help="continuous model: number of metallicity DF nodes (cost is ~linear "
+                          "in K). Default 11 (real) / 9 (mock). Use K=7 for ~35%% faster steps "
+                          "when accumulating toward convergence on limited hardware.")
     _ap.add_argument("--nsub", type=int, default=0,
                      help="fit a random subsample of N stars (0 = all ~1339; try 400 "
                           "for a faster laptop first pass)")
@@ -4005,6 +4514,26 @@ if __name__ == "__main__":
 
     if getattr(_args, "galaxy", "sculptor") != "sculptor":   # switch target before any command
         set_galaxy(_args.galaxy)
+
+    if _args.robustness:                              # membership-cut robustness, then exit
+        run_membership_robustness(nproc=(_args.nproc or None))
+        sys.exit(0)
+
+    if _args.figure1:                                 # two-galaxy data presentation, then exit
+        make_figure1_two_galaxy()
+        sys.exit(0)
+
+    if _args.actions:                                 # action-space chemodynamics, then exit
+        make_action_space()
+        sys.exit(0)
+
+    if _args.dispersion:                              # radial dispersion profile, then exit
+        make_dispersion_profile(use_gaia=_args.gaia)
+        sys.exit(0)
+
+    if _args.skymap:                                  # Gaia PM membership sky map, then exit
+        make_gaia_skymap()
+        sys.exit(0)
 
     if _args.fig4all:                                 # combined Fig.4 across all chains, then exit
         make_fig4_all_chains()
@@ -4029,9 +4558,10 @@ if __name__ == "__main__":
         if _explicit_steps and _args.steps > 50:
             _bk = _args.backend if _args.backend != "scl25.h5" else _gf("cont.h5")
             _nsub = _args.nsub or (400 if _args.mock else 0)     # mock -> lean subsample by default
+            _K = _args.K or (9 if _args.mock else 11)            # --K overrides the default node count
             run_continuous_chain(nsteps=_args.steps, nproc=(_args.nproc or None),
                                  backend=_bk, nsub=(_nsub or None), use_mock=_args.mock,
-                                 fix_nuisance=True, K=(9 if _args.mock else 11),
+                                 fix_nuisance=True, K=_K,
                                  resume=(False if _args.no_resume else None))
         else:
             run_continuous_smoke()

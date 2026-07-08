@@ -6,7 +6,7 @@
 #
 #  Author:  Rishi Sanjeev, The Charter School of Wilmington
 #  Contact: rishsanjeev@gmail.com
-#  License: MIT  (see LICENSE)
+#  License: Creative Commons CC-BY  (see LICENSE)
 #
 #  Companion code for the paper.
 #  Measures the dark-matter inner density slope of the Sculptor (and Fornax) dwarf

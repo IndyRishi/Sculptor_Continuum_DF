@@ -3187,6 +3187,118 @@ def run_reverse_bias_gate(gamma_true=(0.4, 1.0), n_real=40, out="figure_reverse_
     return results
 
 
+def run_gate_diagnostics(gamma_true=(0.4, 1.0), n_real=40, out="figure_gate_diagnostics.png"):
+    """
+    CONTROL TESTS for the two bias gates. These are not optional extras: the reverse gate's
+    *matched* model -- a discrete median split applied to genuinely discrete truth -- came back
+    biased by -0.31 at gamma_true = 1.0. A matched model fitted to matching truth should be
+    nearly unbiased. When the control fails, the test is not measuring what it claims to measure,
+    and neither gate can be interpreted until this is understood. Both diagnostics are cheap
+    mocks.
+
+    (1) NULL TEST. A single Plummer tracer, ONE population, NO metallicity structure whatsoever
+        (grad = 0, so [Fe/H] is pure Gaussian noise), recovered both ways. There is no
+        decomposition to get right here, so ANY bias is a BASELINE OFFSET of the estimator
+        itself -- most plausibly prior pull against the gamma in [0, 1.9] bound acting on a
+        likelihood that Section 5.1 shows is nearly flat in gamma. Every number reported by
+        either gate must be read RELATIVE to this offset rather than relative to zero. Note the
+        'discrete' arm here splits pure noise at its median, which is a decomposition of nothing:
+        if that alone produces bias, the gates' 'discrete' arms are partly measuring an artifact.
+
+    (2) LABEL-SCRAMBLE TEST. Take the discrete two-population mock and randomly PERMUTE the
+        [Fe/H] values across stars. This destroys the chemo-dynamical link exactly while
+        preserving the spatial distribution exactly. Bias that SURVIVES the scramble is driven by
+        tracer spatial structure; bias that DISAPPEARS was driven by the genuine
+        metallicity-orbit correlation. This matters because the two gates differ in more than
+        their metallicity structure: the forward gate uses ONE Plummer (a0 = 0.28 kpc) while the
+        reverse gate uses TWO (0.1875 and 0.3983 kpc). Their opposite bias signs may therefore
+        reflect the tracer spatial structure rather than the decomposition choice -- a confound
+        that would make the paired-gate claim unsupportable as currently framed.
+
+    Writes figure_gate_diagnostics.png. Mocks only; no network.
+    """
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    def _recover(R, vlos, feh, s):
+        """Return (gamma_discrete_median_split, gamma_continuous_all_stars)."""
+        med = np.median(feh)
+        pops = []
+        for sel in (feh < med, feh >= med):
+            a = float(np.median(R[sel])); rc, so, se = _binprof(R[sel], vlos[sel])
+            pops.append((a, rc, so, se))
+        gd = _gnfw_gamma_posterior(pops, seed=s)
+        a = float(np.median(R)); rc, so, se = _binprof(R, vlos)
+        gc = _gnfw_gamma_posterior([(a, rc, so, se)], seed=s + 991)
+        return gd, gc
+
+    print("=" * 70)
+    print("  GATE DIAGNOSTICS")
+    print("    (1) NULL      : one population, NO metallicity structure -> baseline offset?")
+    print("    (2) SCRAMBLE  : discrete mock with [Fe/H] permuted -> spatial or chemical?")
+    print("=" * 70)
+
+    results = {}
+    for gt in gamma_true:
+        nd, nc, sd, sc = [], [], [], []
+        for s in range(n_real):
+            # (1) null: single Plummer, grad = 0 -> [Fe/H] is pure noise
+            R, vlos, feh = _continuous_gradient_mock(gt, s, grad=0.0)
+            g1, g2 = _recover(R, vlos, feh, s); nd.append(g1); nc.append(g2)
+            # (2) scramble: discrete truth, chemo-dynamical link destroyed, geometry preserved
+            R, vlos, feh = _discrete_twopop_mock(gt, s)
+            feh = np.random.default_rng(s + 4242).permutation(feh)
+            g1, g2 = _recover(R, vlos, feh, s); sd.append(g1); sc.append(g2)
+        nd, nc, sd, sc = (np.array(v) for v in (nd, nc, sd, sc))
+        results[gt] = dict(null_disc=nd, null_cont=nc, scr_disc=sd, scr_cont=sc)
+
+        print(f"\n  gamma_true = {gt}   ({n_real} realisations each)")
+        print(f"    (1) NULL      one pop, no [Fe/H] structure")
+        print(f"          median split  : <gamma> = {nd.mean():.3f}   bias = {nd.mean()-gt:+.3f} "
+              f"+/- {nd.std()/np.sqrt(n_real):.3f}")
+        print(f"          all stars     : <gamma> = {nc.mean():.3f}   bias = {nc.mean()-gt:+.3f} "
+              f"+/- {nc.std()/np.sqrt(n_real):.3f}")
+        base = nc.mean() - gt
+        if abs(base) > 0.05:
+            print(f"       -> BASELINE OFFSET of {base:+.3f} with NO decomposition to get wrong.")
+            print(f"          Both gates must be read relative to this, not to zero.")
+        else:
+            print(f"       -> estimator unbiased on a featureless mock; the gates' biases are real.")
+        print(f"    (2) SCRAMBLE  discrete truth, [Fe/H] permuted (link destroyed, geometry kept)")
+        print(f"          median split  : <gamma> = {sd.mean():.3f}   bias = {sd.mean()-gt:+.3f} "
+              f"+/- {sd.std()/np.sqrt(n_real):.3f}")
+        print(f"          all stars     : <gamma> = {sc.mean():.3f}   bias = {sc.mean()-gt:+.3f} "
+              f"+/- {sc.std()/np.sqrt(n_real):.3f}")
+        print(f"       -> compare 'median split' here with the REAL reverse gate at the same "
+              f"gamma_true.")
+        print(f"          Bias that survives the scramble is SPATIAL (tracer structure), not "
+              f"chemo-dynamical.")
+
+    fig, axes = plt.subplots(1, len(gamma_true), figsize=(6.6 * len(gamma_true), 4.8), squeeze=False)
+    for ax, gt in zip(axes[0], gamma_true):
+        r = results[gt]
+        labels = ['null\nsplit', 'null\nall-star', 'scrambled\nsplit', 'scrambled\nall-star']
+        keys = ['null_disc', 'null_cont', 'scr_disc', 'scr_cont']
+        cols = ['lightcoral', 'darkseagreen', 'crimson', 'seagreen']
+        for i, (k, c) in enumerate(zip(keys, cols)):
+            v = r[k]
+            ax.errorbar(i, v.mean(), yerr=v.std() / np.sqrt(len(v)), fmt='o', color=c,
+                        ms=9, capsize=5, lw=2)
+            ax.annotate(f'{v.mean()-gt:+.2f}', (i, v.mean()), textcoords='offset points',
+                        xytext=(0, 13), ha='center', fontsize=9)
+        ax.axhline(gt, color='k', ls='--', lw=2, label=f'truth $\\gamma$={gt}')
+        ax.set_xticks(range(4)); ax.set_xticklabels(labels, fontsize=9)
+        ax.set_xlim(-0.5, 3.5); ax.set_ylabel(r'recovered $\gamma$ (posterior median)')
+        ax.set_title(f'$\\gamma_{{\\rm true}}={gt}$'); ax.legend(fontsize=9); ax.grid(alpha=0.3)
+    fig.suptitle('Gate controls: baseline estimator offset (null) and spatial-vs-chemical bias '
+                 '(scramble)', fontsize=12)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"\n--> Saved {out}")
+    return results
+
+
 def run_bias_vs_realizations(gamma_true=1.0, max_real=40, out="figure_bias_vs_realizations.png"):
     """
     Mean recovered-gamma bias as a function of the number of mock realisations, for the
@@ -4695,6 +4807,14 @@ if __name__ == "__main__":
                           "recovers gamma. The companion to --biasgate: together they test the "
                           "population-decomposition choice in BOTH directions. Writes "
                           "figure_reverse_bias_gate.png.")
+    _ap.add_argument("--gatediag", action="store_true",
+                     help="Control tests for both bias gates. (1) NULL: one population, no "
+                          "metallicity structure -- any bias is a baseline estimator offset, not "
+                          "a decomposition effect. (2) SCRAMBLE: discrete mock with [Fe/H] "
+                          "permuted -- separates bias driven by tracer spatial structure from "
+                          "bias driven by the real metallicity-orbit link. Run this before "
+                          "interpreting --biasgate or --revgate. Writes "
+                          "figure_gate_diagnostics.png.")
     _ap.add_argument("--pop3", action="store_true",
                      help="Very-metal-poor contamination test: refit WP11 Gamma with "
                           "progressively stricter [Fe/H] floors to check whether the slope is "
@@ -4789,6 +4909,10 @@ if __name__ == "__main__":
 
     if _args.revgate:                                 # reverse bias gate on mocks, then exit
         run_reverse_bias_gate()
+        sys.exit(0)
+
+    if _args.gatediag:                                # gate control tests on mocks, then exit
+        run_gate_diagnostics()
         sys.exit(0)
 
     if _args.pop3:                                    # very-metal-poor contamination, then exit

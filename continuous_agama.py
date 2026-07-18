@@ -3299,6 +3299,94 @@ def run_gate_diagnostics(gamma_true=(0.4, 1.0), n_real=40, out="figure_gate_diag
     return results
 
 
+def run_shrinkage_test(gamma_true=(0.4, 1.0), nsteps_grid=(400, 1600, 6400), n_real=20,
+                       out="figure_shrinkage_test.png"):
+    """
+    Does the estimator's baseline bias come from the PRIOR or from NON-CONVERGENCE?
+
+    run_gate_diagnostics()'s NULL test found a baseline offset with no decomposition to get
+    wrong: +0.226 at gamma_true = 0.4 and -0.063 at gamma_true = 1.0, i.e. recovered values of
+    0.626 and 0.937 that both sit near the prior median of 0.95 (the prior is 0 <= gamma <= 1.9).
+    Two explanations, with opposite consequences for the paper:
+
+      PRIOR SHRINKAGE -- the sigma_los likelihood is nearly flat in gamma (Section 5.1), so the
+        posterior is pulled toward the prior median regardless of chain length. If this is the
+        cause, run_dm5_chain() suffers it too, and the reported gamma = 0.78 is BIASED HIGH:
+        the true slope would be lower, i.e. MORE CORED. This is a systematic on a headline
+        number and it runs in the paper's favour, which is exactly why it must be found here
+        rather than by a referee.
+
+      NON-CONVERGENCE -- _gnfw_gamma_posterior() runs only 16 walkers x 400 steps (it is called
+        in a 40-realisation loop, so it is deliberately short). The walkers start at gamma = 0.7.
+        If 400 steps is simply too few, the bias is an artifact of the gate machinery only, and
+        run_dm5_chain() at 24 walkers x 4000 steps is unaffected.
+
+    THE TEST: re-run the NULL at increasing chain lengths. Bias that SHRINKS toward zero as
+    nsteps grows was non-convergence. Bias that PLATEAUS is the prior, and it applies to every
+    sigma_los fit in the paper including run_dm5_chain().
+
+    Writes figure_shrinkage_test.png. Mocks only; no network.
+    """
+    import matplotlib
+    try: matplotlib.use("Agg")
+    except Exception: pass
+    import matplotlib.pyplot as plt
+
+    prior_lo, prior_hi = 0.0, 1.9
+    prior_med = 0.5 * (prior_lo + prior_hi)
+    print("=" * 70)
+    print("  SHRINKAGE TEST: is the null-test bias the PRIOR or NON-CONVERGENCE?")
+    print(f"  prior on gamma = [{prior_lo}, {prior_hi}], median = {prior_med:.2f}")
+    print("  bias SHRINKS with nsteps -> non-convergence (gate machinery only)")
+    print("  bias PLATEAUS            -> prior; applies to run_dm5_chain() too")
+    print("=" * 70)
+
+    results = {}
+    for gt in gamma_true:
+        print(f"\n  gamma_true = {gt}   (predicted prior-shrinkage direction: "
+              f"{'+' if prior_med > gt else '-'}{abs(prior_med - gt):.2f} x shrinkage fraction)")
+        per_len = []
+        for ns in nsteps_grid:
+            g = []
+            for s in range(n_real):
+                R, vlos, feh = _continuous_gradient_mock(gt, s, grad=0.0)   # null: no [Fe/H] info
+                a = float(np.median(R)); rc, so, se = _binprof(R, vlos)
+                g.append(_gnfw_gamma_posterior([(a, rc, so, se)], nsteps=ns, seed=s + 991))
+            g = np.array(g); per_len.append(g)
+            print(f"    nsteps = {ns:5d} : <gamma> = {g.mean():.3f}   bias = {g.mean()-gt:+.3f} "
+                  f"+/- {g.std()/np.sqrt(n_real):.3f}")
+        results[gt] = per_len
+        b0, bN = per_len[0].mean() - gt, per_len[-1].mean() - gt
+        shrunk = abs(bN) < 0.5 * abs(b0)
+        print(f"    -> |bias| went {abs(b0):.3f} -> {abs(bN):.3f} over {nsteps_grid[0]}->"
+              f"{nsteps_grid[-1]} steps")
+        if shrunk:
+            print(f"       NON-CONVERGENCE: the gate's short chains are the cause. "
+                  f"run_dm5_chain() (4000 steps) is unaffected; gamma = 0.78 stands.")
+        else:
+            print(f"       PRIOR SHRINKAGE: bias persists at long chain length. This applies to "
+                  f"EVERY sigma_los fit in the paper, including run_dm5_chain().")
+            print(f"       => the reported gamma is pulled toward {prior_med:.2f}; the true slope "
+                  f"is {'LOWER (MORE CORED)' if gt < prior_med else 'HIGHER'}. Report it.")
+
+    fig, axes = plt.subplots(1, len(gamma_true), figsize=(6.4 * len(gamma_true), 4.6), squeeze=False)
+    for ax, gt in zip(axes[0], gamma_true):
+        m = np.array([v.mean() for v in results[gt]])
+        e = np.array([v.std() / np.sqrt(len(v)) for v in results[gt]])
+        ax.errorbar(nsteps_grid, m - gt, yerr=e, fmt='o-', color='darkslateblue', capsize=4, lw=1.8,
+                    label='null-test bias')
+        ax.axhline(0, color='k', ls='--', lw=2, label='unbiased')
+        ax.axhline(prior_med - gt, color='crimson', ls=':', lw=1.6,
+                   label=f'full shrinkage to prior median ({prior_med:.2f})')
+        ax.set_xscale('log'); ax.set_xlabel('MCMC steps'); ax.set_ylabel(r'bias in recovered $\gamma$')
+        ax.set_title(f'$\\gamma_{{\\rm true}}={gt}$'); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    fig.suptitle('Is the baseline bias the prior or the chain length? '
+                 '(shrinking = convergence; flat = prior)', fontsize=12)
+    fig.tight_layout(); fig.savefig(out, dpi=150, bbox_inches='tight'); plt.close(fig)
+    print(f"\n--> Saved {out}")
+    return results
+
+
 def run_bias_vs_realizations(gamma_true=1.0, max_real=40, out="figure_bias_vs_realizations.png"):
     """
     Mean recovered-gamma bias as a function of the number of mock realisations, for the
@@ -4815,6 +4903,12 @@ if __name__ == "__main__":
                           "bias driven by the real metallicity-orbit link. Run this before "
                           "interpreting --biasgate or --revgate. Writes "
                           "figure_gate_diagnostics.png.")
+    _ap.add_argument("--shrinkage", action="store_true",
+                     help="Is the gate's baseline bias the PRIOR or NON-CONVERGENCE? Re-runs the "
+                          "null test at increasing chain lengths. Bias that shrinks with nsteps "
+                          "was non-convergence (gate machinery only); bias that plateaus is the "
+                          "prior and applies to run_dm5_chain() too, meaning the reported gamma "
+                          "is pulled toward the prior median. Writes figure_shrinkage_test.png.")
     _ap.add_argument("--pop3", action="store_true",
                      help="Very-metal-poor contamination test: refit WP11 Gamma with "
                           "progressively stricter [Fe/H] floors to check whether the slope is "
@@ -4913,6 +5007,10 @@ if __name__ == "__main__":
 
     if _args.gatediag:                                # gate control tests on mocks, then exit
         run_gate_diagnostics()
+        sys.exit(0)
+
+    if _args.shrinkage:                               # prior-vs-convergence test, then exit
+        run_shrinkage_test()
         sys.exit(0)
 
     if _args.pop3:                                    # very-metal-poor contamination, then exit

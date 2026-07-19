@@ -115,8 +115,13 @@ FINAL_JOINT_MEMBERSHIP_MIN = 0.75
 
 # ── Phase-4 (action-DF) parameters, from Arroyo-Polonio et al. (2025) ─────────
 G_KPC   = 4.300917e-6   # kpc (km/s)^2 / Msun
-RE_MR   = 0.18          # kpc, metal-rich Plummer scale (Zhu+16 / WP11)
-RE_MP   = 0.28          # kpc, metal-poor Plummer scale
+# Metal-rich/metal-poor Plummer tracer scales, seeded from Walker & Penarrubia (2011,
+# ApJ 742, 20) Table 4 free-MCMC-fitted half-light radii for Sculptor: r_h,1 (metal-rich)
+# = 167 pc, r_h,2 (metal-poor) = 302 pc. NOT from Zhu et al. (2016), who report only a
+# single combined half-light radius for Sculptor (0.26 kpc) and do not independently
+# measure the two-population split.
+RE_MR   = 0.167         # kpc, metal-rich Plummer scale (WP11 Table 4, r_h,1)
+RE_MP   = 0.302         # kpc, metal-poor Plummer scale (WP11 Table 4, r_h,2)
 FRAC_MR = 0.35          # MR fraction of members
 V_SYS   = 111.2         # km/s systemic (AP24)
 BETA_DM = 3.0           # default gNFW outer slope for the FAST (3-param) MLE only
@@ -137,7 +142,7 @@ GALAXIES = {
         # e and D follow Munoz et al. (2018) / Martinez-Vazquez et al. (2015) as tabulated by
         # Arroyo-Polonio et al. (2024, A&A 692, A195, Table 1), who analyse this same sample.
         distance_kpc=83.9, v_sys=111.2, ellipticity=0.33, pa_deg=92.0,
-        re_mr=0.18, re_mp=0.28,                          # tracer Plummer scales (kpc)
+        re_mr=0.167, re_mp=0.302,       # tracer Plummer scales (kpc); WP11 Table 4 r_h,1/r_h,2
         catalog='J/A+A/675/A49', cols=None,              # Tolstoy+2023 ([Fe/H] auto-detected)
         feh_quality_keep=(0,), mem_keep=('m',),
         wp11_xlim=(2.0, 2.75), wp11_ylim=(6.3, 7.9)),    # WP11 Fig.10 panel range (log10)
@@ -896,7 +901,7 @@ def agama_fit_halo(R, vlos, r_star_label, r_a_fixed=1.5):
     """
     Recover (gamma, rs, log_rho_s) by fitting the sigma_los(R) profiles of BOTH
     stellar populations SIMULTANEOUSLY in a single shared DM potential. The two
-    populations have different scale radii (0.18, 0.28 kpc) and probe M(<r) at two
+    populations have different scale radii (0.167, 0.302 kpc) and probe M(<r) at two
     radii — the two-population constraint (Battaglia+08; Walker & Peñarrubia+11)
     that breaks the mass-anisotropy degeneracy. A single-population sigma_los fit,
     by contrast, collapses a genuine cusp to a false core.
@@ -1499,7 +1504,8 @@ def run_action_df_modeling(high_fidelity=False, mcmc_nwalkers=32, mcmc_nsteps=30
     # ── Figure ───────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(2, 2, figsize=(13, 10))
     cols  = {RE_MR: 'crimson', RE_MP: 'royalblue'}
-    names = {RE_MR: 'Metal-rich ($R_e$=0.18 kpc)', RE_MP: 'Metal-poor ($R_e$=0.28 kpc)'}
+    names = {RE_MR: f'Metal-rich ($R_e$={RE_MR:.3f} kpc)',
+             RE_MP: f'Metal-poor ($R_e$={RE_MP:.3f} kpc)'}
     src   = "real Tolstoy+2023" if used_real else "Section-5 mock"
 
     # (a) two-population sigma_los fit
@@ -3648,7 +3654,17 @@ def _load_gaia_matched():
 
 def _gaia_pm_dispersion_profile(nbins=8):
     """Plane-of-sky PM velocity-dispersion profile (radial, tangential) in km/s, from Gaia
-    proper motions of members (P_mem_PM > 0.5). Returns (Rc, sigR, sigT) or None."""
+    proper motions of members (P_mem_PM > 0.5). Returns (Rc, sigR, sigT) or None.
+
+    Radial/tangential are defined PER STAR relative to its own position angle around the
+    galaxy centre, not the fixed RA/Dec axes: for a star at sky offset (dRA, dDec) from
+    centre, radial points away from centre (unit vector (cos th, sin th) with
+    th = atan2(dDec, dRA)) and tangential is perpendicular to it. Naively taking the
+    dispersion of the raw pmra/pmdec components instead would only be correct for stars
+    lying exactly along the RA axis through the centre; for stars elsewhere on the sky the
+    RA/Dec components are a mix of true radial and tangential motion, and treating them as
+    if aligned biases the anisotropy this profile is meant to probe.
+    """
     df = _load_gaia_matched()
     df = df[df['P_mem_PM'] > 0.5].reset_index(drop=True)
     if len(df) < 40:
@@ -3656,6 +3672,12 @@ def _gaia_pm_dispersion_profile(nbins=8):
     kms = 4.74047 * GAL['distance_kpc']                            # mas/yr -> km/s at distance
     dpmra = (df['pmra'].values - np.median(df['pmra'].values)) * kms
     dpmdec = (df['pmdec'].values - np.median(df['pmdec'].values)) * kms
+    dRA = (df['ra'].values - RA0_DEG) * np.cos(np.radians(DEC0_DEG))
+    dDec = df['dec'].values - DEC0_DEG
+    theta = np.arctan2(dDec, dRA)                                  # per-star position angle
+    ct, st = np.cos(theta), np.sin(theta)
+    pm_rad =  dpmra * ct + dpmdec * st                              # projection onto r-hat
+    pm_tan = -dpmra * st + dpmdec * ct                              # projection onto theta-hat
     R = df['R_kpc'].values
     edges = np.quantile(R, np.linspace(0, 1, nbins + 1))
     Rc, sR, sT = [], [], []
@@ -3663,7 +3685,7 @@ def _gaia_pm_dispersion_profile(nbins=8):
         m = (R >= edges[i]) & (R < edges[i + 1]) if i < nbins - 1 else (R >= edges[i])
         if m.sum() < 8:
             continue
-        Rc.append(np.median(R[m])); sR.append(np.std(dpmra[m])); sT.append(np.std(dpmdec[m]))
+        Rc.append(np.median(R[m])); sR.append(np.std(pm_rad[m])); sT.append(np.std(pm_tan[m]))
     return np.array(Rc), np.array(sR), np.array(sT)
 
 
